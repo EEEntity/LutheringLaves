@@ -28,10 +28,21 @@ base_dir = os.path.dirname(sys.argv[0])
 logger.info(f"base dir: {base_dir}")
 
 WW_LAUNCHER_DOWNLOAD_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/launcher/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/G152/index.json'
-WW_LAUNCHER_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json'
+WW_RESOURCE_INDEX_HOSTS = (
+    'https://prod-volcdn-gamestarter.kurogame.xyz',
+    'https://prod-tencentcdn-gamestarter.kurogame.com',
+    'https://prod-cn-alicdn-gamestarter.kurogame.com',
+)
+WW_RESOURCE_INDEX_PATH = 'launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json'
 LOCAL_MD5_CHUNK_SIZE = 4 * 1024 * 1024
 PATCH_STREAM_MEMORY_LIMIT = 4 * 1024 ** 3
-GAME_QUALITY_PARAM = '-krqlv=hd'
+QUALITY_LEVELS = ('uhd', 'hd', 'sd')
+DEFAULT_QUALITY = 'hd'
+QUALITY_NAMES = {
+    'uhd': '极致(UHD)',
+    'hd': '高清(HD)',
+    'sd': '流畅(SD)',
+}
 
 class LauncherState(Enum):
     STARTGAME = 0
@@ -65,8 +76,13 @@ class Launcher:
         if Launcher._initialized:
             return
         
-        self.launcher_api = WW_LAUNCHER_API
-        self.launcher_info = self.get_result(self.launcher_api)
+        self.launcher_info = None
+        for host in WW_RESOURCE_INDEX_HOSTS:
+            info = self.get_result(host + '/' + WW_RESOURCE_INDEX_PATH)
+            if info:
+                self.launcher_info = info
+                logger.info(f'resource index loaded from: {host}')
+                break
         
         if self.launcher_info is None:
             self.state = LauncherState.NETWORKERROR
@@ -83,13 +99,17 @@ class Launcher:
             
         self.temp_folder_path = None
         
-        # get last version game filelist
-        self.gamefile_index = self.get_gamefile_index()
-            
-        # download url middle path
-        self.resources_base_path = self.launcher_info['default']['resourcesBasePath'] if self.launcher_info else None
-        self.current_version = self.launcher_info['default']['version'] if self.launcher_info else None
+        # 资源包信息
+        self.resource_packs = self.launcher_info.get('resourcePacks') or {}
+        self.pack_resources_cache = {}
+        self.dest_base_map = {}
+        self.current_version = (self.resource_packs.get('common') or {}).get('version')
+        if not self.current_version:
+            self.state = LauncherState.NETWORKERROR
+            logger.error('资源索引中缺少 common 资源包信息')
+            return
         self.local_version = self.get_localVersion()
+        self.local_pack_versions = self.get_localPackVersions()
         
         self.download_game_progress = ProgressInfo()
         self.verify_game_progress = ProgressInfo()
@@ -97,24 +117,28 @@ class Launcher:
         self.update_game_progress_patch = ProgressInfo()
         
         self.support_incremental_patching = False
-        self.target_patch = None
-        self.gamefile_index_patch = None
-        self.resources_base_path_patch = None
+        self.patch_targets = []
         self.progress_callback = None
         self.downloaded_bytes = 0
         self.chunk_md5_cache = {}
         
+        self.init_launcher_settings()
         self.init_launcher_state()
         self.init_incremental_update()
-        self.init_launcher_settings()
         self.init_background()
     
     def init_launcher_state(self):
         self.state = LauncherState.STARTGAME
-        logger.info("set launcher state to STARTGAME")
+        logger.info('set launcher state to STARTGAME')
+        
+        quality = self.get_download_quality()
+        resource_list = self.get_resource_list()
+        if resource_list is None:
+            self.state = LauncherState.NETWORKERROR
+            logger.error('resource index unavailable, set launcher state to NETWORKERROR')
+            return
         
         if self.local_version is None:
-            resource_list = list(self.gamefile_index['resource'])
             for file in resource_list:
                 file_path = self.game_folder_path.joinpath(Path(file['dest']))
                 if not file_path.exists():
@@ -126,6 +150,12 @@ class Launcher:
                 self.state = LauncherState.NEEDUPDATE
                 logger.info("set launcher state to NEEDUPDATE")
                 return
+            # 切换档位后需要补对应资源
+            for pack in ('common', quality):
+                if not self.is_pack_ready(pack):
+                    self.state = LauncherState.NEEDUPDATE
+                    logger.info(f'resource pack {pack} not complete, set launcher state to NEEDUPDATE')
+                    return
     
     def init_launcher_settings(self):
         settings_file_path = Path(base_dir) / 'settings.json'
@@ -137,7 +167,8 @@ class Launcher:
                 "proton_media_use_gst": "0",
                 "proton_enable_wayland": "0",
                 "proton_no_d3d12": "0",
-                "mangohud": "0"
+                "mangohud": "0",
+                "download_quality": DEFAULT_QUALITY
             }
 
             if self.get_latest_proton():
@@ -149,7 +180,10 @@ class Launcher:
                 
         with open(settings_file_path, 'r', encoding='utf-8') as f:
             settings = json.load(f)
-            self.settings = settings
+        # 兼容旧设置
+        if settings.get('download_quality') not in QUALITY_LEVELS:
+            settings['download_quality'] = DEFAULT_QUALITY
+        self.settings = settings
             
     def init_background(self):
         background_config = {
@@ -178,24 +212,85 @@ class Launcher:
             self.background_config['slogan'] = slogan_file_name
         
         
-    def get_gamefile_index(self):
-        if self.launcher_info is None: return None
-        
-        indexfile_uri = self.launcher_info['default']['config']['indexFile']
-        indexfile = self.get_result(urljoin(self.cdn_node, indexfile_uri))
-        
-        if not indexfile: return None
-        
-        return indexfile
+    def get_download_quality(self):
+        quality = self.settings.get('download_quality', DEFAULT_QUALITY) if hasattr(self, 'settings') else DEFAULT_QUALITY
+        return quality if quality in QUALITY_LEVELS else DEFAULT_QUALITY
+
+    def pack_base_url(self, name):
+        base = (self.resource_packs.get(name) or {}).get('baseUrl') or ''
+        if base and not base.endswith('/'):
+            base += '/'
+        return base
+
+    def get_pack_resources(self, name):
+        if name in self.pack_resources_cache:
+            return self.pack_resources_cache[name]
+        pack = self.resource_packs.get(name)
+        if not pack:
+            logger.error(f'资源索引中不存在资源包: {name}')
+            return None
+        url = urljoin(self.cdn_node, pack['indexFile'])
+        raw = self.get_result_bytes(url)
+        if raw is None:
+            logger.error(f'资源包清单下载失败: {name}')
+            return None
+        expect_md5 = pack.get('indexFileMd5')
+        actual_md5 = hashlib.md5(raw).hexdigest()
+        if expect_md5 and actual_md5 != expect_md5:
+            logger.error(f'资源包清单校验失败: {name} (期望 {expect_md5}, 实际 {actual_md5})')
+            return None
+        try:
+            data = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeError) as e:
+            logger.error(f'资源包清单解析失败: {name} ({e})')
+            return None
+        resources = data.get('resource') or []
+        self.pack_resources_cache[name] = resources
+        return resources
+
+    def get_resource_list(self):
+        resource_list = []
+        self.dest_base_map = {}
+        for name in ('common', self.get_download_quality()):
+            resources = self.get_pack_resources(name)
+            if resources is None:
+                return None
+            base = self.pack_base_url(name)
+            for resource in resources:
+                self.dest_base_map.setdefault(resource['dest'], base)
+                resource_list.append(resource)
+        return resource_list
+
+    def is_pack_files_present(self, name):
+        resources = self.get_pack_resources(name)
+        if resources is None:
+            return False
+        for resource in resources:
+            if not self.game_folder_path.joinpath(Path(resource['dest'])).exists():
+                return False
+        return True
+
+    def is_pack_ready(self, name):
+        local_pack_versions = getattr(self, 'local_pack_versions', None)
+        marker = local_pack_versions.get(name) if local_pack_versions is not None else None
+        if marker is None and local_pack_versions is None and name in ('common', 'hd'):
+            marker = getattr(self, 'local_version', None)
+        target = (self.resource_packs.get(name) or {}).get('version')
+        if not marker or not target or marker != target:
+            return False
+        return self.is_pack_files_present(name)
 
     def build_download_url(self, dest):
-        url = urljoin(self.cdn_node, self.resources_base_path + "/" + dest)
+        base = self.dest_base_map.get(dest) or self.pack_base_url('common')
+        url = urljoin(self.cdn_node, base + dest)
         return quote(url, safe=':/')
 
     def download_game(self):
         logger.info('Start downloading game client files...')
         self.state = LauncherState.DOWNLOADING
-        resource_list = list(self.gamefile_index['resource'])
+        resource_list = self.get_resource_list()
+        if resource_list is None:
+            raise RuntimeError('无法获取官方资源清单，请稍后重试')
         self.download_game_progress.total_count = len(resource_list)
         for resource in resource_list:
             self.download_game_progress.total_size += resource['size']
@@ -213,7 +308,9 @@ class Launcher:
     def update_game(self):
         logger.info('Starting update game client files...')
         self.state = LauncherState.UPDATING
-        resource_list = list(self.gamefile_index['resource'])
+        resource_list = self.get_resource_list()
+        if resource_list is None:
+            raise RuntimeError('无法获取官方资源清单，请稍后重试')
         self.update_game_progress.total_count = len(resource_list)
         for resource in resource_list:
             self.update_game_progress.total_size += resource['size']
@@ -267,73 +364,84 @@ class Launcher:
             self.update_game_progress.finished_count += 1
     
     def download_patch(self):
-        if not self.gamefile_index_patch:
+        if not self.patch_targets:
             raise RuntimeError('增量补丁不可用')
         # 硬盘空间检查
-        required = 0
-        if self.target_patch:
-            ext = self.target_patch[0].get('ext') or {}
+        for target in self.patch_targets:
+            ext = target['entry'].get('ext') or {}
             required = int(ext.get('requiredDiskSpace') or 0)
-        if required > 0:
-            free = shutil.disk_usage(str(self.game_folder_path)).free
-            if free < required:
-                required_gib = required / 1024 ** 3
-                free_gib = free / 1024 ** 3
-                raise RuntimeError(f'磁盘空间不足: 更新需要 {required_gib:.2f} GiB, 当前可用 {free_gib:.2f} GiB')
+            if required > 0:
+                free = shutil.disk_usage(str(self.game_folder_path)).free
+                if free < required:
+                    required_gib = required / 1024 ** 3
+                    free_gib = free / 1024 ** 3
+                    raise RuntimeError(f'磁盘空间不足: 更新需要 {required_gib:.2f} GiB, 当前可用 {free_gib:.2f} GiB')
         self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
         if not self.temp_folder_path.exists():
             self.temp_folder_path.mkdir()
-        resource_list = self.gamefile_index_patch.get('resource', [])
-        length = len(resource_list)
-        self.update_game_progress_patch.total_count = length
-        self.update_game_progress_patch.total_size = 0
-        for file in resource_list:
-            self.update_game_progress_patch.total_size += int(file['size'])
-        for i, file in enumerate(resource_list):
-            file_size = int(file['size'])
-            if 'fromFolder' in file:
-                base = file['fromFolder']
-                if not base.endswith('/'):
-                    base += '/'
-                download_url = urljoin(self.cdn_node, base + file['dest'])
-                file_path = self.game_folder_path.joinpath(Path(file['dest']))
-            else:
-                base = self.resources_base_path_patch
-                if not base.endswith('/'):
-                    base += '/'
-                download_url = urljoin(self.cdn_node, base + file['dest'])
-                file_path = self.temp_folder_path.joinpath(Path(file['dest']))
-            download_url = quote(download_url, safe=':/')
-            logger.info(f'Downloading patch resource {i+1}/{length}: {file_path}')
-            if not self.download_file_with_resume(
-                url=download_url,
-                file_path=file_path,
-                flag='update_patch',
-                file_size=file_size
-            ):
-                raise RuntimeError(f'补丁资源下载失败: {file_path}')
-            self.update_game_progress_patch.finished_count += 1
+        total_count = 0
+        total_size = 0
+        for target in self.patch_targets:
+            for file in target['manifest'].get('resource', []):
+                total_count += 1
+                total_size += int(file['size'])
+        self.update_game_progress_patch.total_count = total_count
+        self.update_game_progress_patch.total_size = total_size
+        done = 0
+        for target in self.patch_targets:
+            pack = target['pack']
+            pack_temp = self.temp_folder_path / pack
+            if not pack_temp.exists():
+                pack_temp.mkdir()
+            pack_base = target['entry'].get('baseUrl') or ''
+            if pack_base and not pack_base.endswith('/'):
+                pack_base += '/'
+            resource_list = target['manifest'].get('resource', [])
+            for file in resource_list:
+                file_size = int(file['size'])
+                if 'fromFolder' in file:
+                    base = file['fromFolder']
+                    if not base.endswith('/'):
+                        base += '/'
+                    download_url = urljoin(self.cdn_node, base + file['dest'])
+                    file_path = self.game_folder_path.joinpath(Path(file['dest']))
+                else:
+                    download_url = urljoin(self.cdn_node, pack_base + file['dest'])
+                    file_path = pack_temp.joinpath(Path(file['dest']))
+                download_url = quote(download_url, safe=':/')
+                done += 1
+                logger.info(f'Downloading patch resource {done}/{total_count} [{pack}]: {file_path}')
+                if not self.download_file_with_resume(
+                    url=download_url,
+                    file_path=file_path,
+                    flag='update_patch',
+                    file_size=file_size
+                ):
+                    raise RuntimeError(f'补丁资源下载失败: {file_path}')
+                self.update_game_progress_patch.finished_count += 1
 
     def merge_patch(self):
-        if not self.gamefile_index_patch:
+        if not self.patch_targets:
             raise RuntimeError('增量补丁清单不可用')
         if not self.temp_folder_path:
             self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
-        group_infos = self.gamefile_index_patch.get('groupInfos', [])
-        length = len(group_infos)
-        for i, group in enumerate(group_infos):
-            group_dest = group['dest']
-            patch_path = self.temp_folder_path.joinpath(Path(group_dest))
-            if not patch_path.exists():
-                raise RuntimeError(f'缺少组补丁文件: {patch_path}')
-            logger.info(f'Applying patch group {i+1}/{length}: {group_dest}')
-            self.apply_group_patch(patch_path, group)
-        # 删除清单
-        for rel in self.gamefile_index_patch.get('deleteFiles', []):
-            target = self.game_folder_path.joinpath(Path(rel))
-            if target.exists():
-                logger.info(f'Deleting obsolete file: {rel}')
-                target.unlink()
+        for target in self.patch_targets:
+            pack = target['pack']
+            pack_temp = self.temp_folder_path / pack
+            group_infos = target['manifest'].get('groupInfos', [])
+            length = len(group_infos)
+            for i, group in enumerate(group_infos):
+                group_dest = group['dest']
+                patch_path = pack_temp.joinpath(Path(group_dest))
+                if not patch_path.exists():
+                    raise RuntimeError(f'缺少组补丁文件: {patch_path}')
+                logger.info(f'Applying patch group {i+1}/{length} [{pack}]: {group_dest}')
+                self.apply_group_patch(patch_path, group)
+            for rel in target['manifest'].get('deleteFiles', []):
+                delete_path = self.game_folder_path.joinpath(Path(rel))
+                if delete_path.exists():
+                    logger.info(f'Deleting obsolete file: {rel}')
+                    delete_path.unlink()
         # 清理临时目录
         if self.temp_folder_path and self.temp_folder_path.exists():
             shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
@@ -395,11 +503,13 @@ class Launcher:
                     file_path.chmod(file_path.stat().st_mode | 0o111)
     def update_game_with_patch(self):
         self.state = LauncherState.UPDATING
+        used_patch = False
         try:
-            self.download_patch()
-            self.merge_patch()
-            logger.info('组补丁增量更新完成')
-            return True
+            if self.patch_targets:
+                self.download_patch()
+                self.merge_patch()
+                used_patch = True
+                logger.info('组补丁增量更新完成')
         except Exception as e:
             logger.exception(f'组补丁增量更新失败，回退到常规更新流程: {e}')
             try:
@@ -408,12 +518,14 @@ class Launcher:
                 self.temp_folder_path = None
             except Exception:
                 pass
-            self.update_game()
-            return False
+        self.update_game() # again
+        return used_patch
 
     def verify_gamefile(self):
         self.state = LauncherState.VALIDATING
-        resource_list = list(self.gamefile_index['resource'])
+        resource_list = self.get_resource_list()
+        if resource_list is None:
+            raise RuntimeError('无法获取官方资源清单，请稍后重试')
         
         chunk_paks = []
         
@@ -481,7 +593,7 @@ class Launcher:
             
         self.update_localVersion()
     
-    def get_result(self, url):
+    def get_result_bytes(self, url):
         try:
             req = Request(url, headers={
                 'User-Agent': 'Mozilla/5.0',
@@ -500,25 +612,31 @@ class Launcher:
                     except Exception as e:
                         logger.error(f"Gzip decompression error: {str(e)}")
                         return None
-                try:
-                    return json.loads(data.decode('utf-8'))
-                except UnicodeDecodeError:
-                    try:
-                        return json.loads(data.decode('gbk'))
-                    except:
-                        logger.error("Failed to decode JSON response")
-                        return None        
+                return data
         except HTTPError as e:
             logger.error(f"HTTP Error {e.code}: {e.reason}")
             return None
         except Exception as e:
-            logger.error(f"Error fetching patch info: {str(e)}")
+            logger.error(f"Error fetching {url}: {str(e)}")
             return None
+    
+    def get_result(self, url):
+        data = self.get_result_bytes(url)
+        if data is None:
+            return None
+        try:
+            return json.loads(data.decode('utf-8'))
+        except UnicodeDecodeError:
+            try:
+                return json.loads(data.decode('gbk'))
+            except Exception:
+                logger.error("Failed to decode JSON response")
+                return None
     
     def select_cdn(self):
         if self.launcher_info is None: return None
         
-        cdnlist = self.launcher_info['default'].get('cdnList', None)
+        cdnlist = self.launcher_info.get('cdnList', None)
         
         if not cdnlist: return None
         
@@ -540,18 +658,92 @@ class Launcher:
             data = json.load(file)
             return data.get('version', None)
     
+    def get_localPackVersions(self):
+        file_path = self.game_folder_path / "launcherDownloadConfig.json"
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+        except (ValueError, OSError):
+            return None
+        packs = data.get('packs')
+        return packs if isinstance(packs, dict) else None
+    
     def update_localVersion(self):
-        new_version = self.current_version
+        packs = dict(self.local_pack_versions) if self.local_pack_versions else {}
+        if self.local_pack_versions is None and self.local_version:
+            for name in ('common', 'hd'):
+                packs.setdefault(name, self.local_version)
+        for name in ('common', self.get_download_quality()):
+            target_version = (self.resource_packs.get(name) or {}).get('version')
+            if target_version and self.is_pack_files_present(name):
+                packs[name] = target_version
+        self.local_pack_versions = packs
         temp = {
-            "version":new_version,
+            "version":self.current_version,
             "reUseVersion":"",
             "state":"",
             "isPreDownload":False,
-            "appId":"10003"
+            "appId":"10003",
+            "packs":packs
         }
         file_path = self.game_folder_path / "launcherDownloadConfig.json"
         with open(file_path, 'w', encoding='utf-8') as file:
             json.dump(temp, file, ensure_ascii=False)
+    
+    def get_quality_status(self):
+        resource_packs = getattr(self, 'resource_packs', None)
+        if not resource_packs:
+            return None
+        result = []
+        for quality in QUALITY_LEVELS:
+            pack = resource_packs.get(quality) or {}
+            size = pack.get('size')
+            result.append({
+                'key': quality,
+                'name': QUALITY_NAMES.get(quality, quality),
+                'size': int(size) if size else None,
+                'downloaded': self.is_pack_ready(quality),
+            })
+        return result
+    
+    def release_quality_packs(self, names):
+        if self.state == LauncherState.GAMERUNNING:
+            raise RuntimeError('游戏正在运行，无法释放资源')
+        pack_dirs = {
+            'uhd': 'Client/Content/UHD/',
+            'hd': 'Client/Content/HD/',
+            'sd': 'Client/Content/SD/',
+        }
+        active_quality = self.get_download_quality()
+        deleted_count = 0
+        freed_bytes = 0
+        for name in names:
+            if name == active_quality:
+                logger.warning(f'不允许释放当前使用中的档位: {name}')
+                continue
+            prefix = pack_dirs.get(name)
+            resources = self.get_pack_resources(name) if prefix else None
+            if not resources:
+                continue
+            for resource in resources:
+                dest = resource['dest']
+                if not dest.startswith(prefix):
+                    logger.warning(f'跳过非档位目录文件: {dest}')
+                    continue
+                file_path = self.game_folder_path.joinpath(Path(dest))
+                if file_path.exists():
+                    try:
+                        freed_bytes += file_path.stat().st_size
+                        file_path.unlink()
+                        deleted_count += 1
+                    except OSError as e:
+                        logger.error(f'删除失败 {file_path}: {e}')
+            if self.local_pack_versions is not None:
+                self.local_pack_versions.pop(name, None)
+        self.update_localVersion()
+        return deleted_count, freed_bytes
     
     def download_file_with_resume(self, url, file_path, overwrite=False, flag=None, file_size=None):
         directory = file_path.parent
@@ -762,35 +954,45 @@ class Launcher:
         except Exception as e:
             logger.error(f'Chunk update error for {file_path}: {str(e)}')
             return -1
-
-    def is_support_incremental_patching(self):
-        if not self.local_version: return False
-        
-        patch_configs = self.launcher_info['default']['config']['patchConfig']
-        
-        target_patch = list(filter(lambda x: x['version'] == self.local_version, patch_configs))
-        
-        if len(target_patch) == 0: return False
-        
-        if len(target_patch[0]['ext']) == 0: return False
     
     def init_incremental_update(self):
-        
-        if not self.local_version: return
-        
-        patch_configs = self.launcher_info['default']['config']['patchConfig']
-        
-        target_patch = list(filter(lambda x: x['version'] == self.local_version, patch_configs))
-        
-        if len(target_patch) == 0: return
-        
-        if len(target_patch[0]['ext']) == 0: return
-        
+        self.support_incremental_patching = False
+        self.patch_targets = []
+        if not self.local_version:
+            return
+        if self.local_version == self.current_version:
+            return
+        targets = []
+        for name in ('common', self.get_download_quality()):
+            pack = self.resource_packs.get(name) or {}
+            entry = None
+            for candidate in (pack.get('patchConfig') or []):
+                if candidate.get('version') == self.local_version and (candidate.get('ext') or {}):
+                    entry = candidate
+                    break
+            if entry is None:
+                logger.info(f'资源包 {name} 无适用于 {self.local_version} 的官方增量补丁，将由常规更新补齐')
+                continue
+            raw = self.get_result_bytes(urljoin(self.cdn_node, entry['indexFile']))
+            if raw is None:
+                logger.warning(f'资源包 {name} 增量补丁清单下载失败，将由常规更新补齐')
+                continue
+            expect_md5 = entry.get('indexFileMd5')
+            if expect_md5 and hashlib.md5(raw).hexdigest() != expect_md5:
+                logger.warning(f'资源包 {name} 增量补丁清单校验失败，将由常规更新补齐')
+                continue
+            try:
+                manifest = json.loads(raw.decode('utf-8'))
+            except (ValueError, UnicodeError):
+                logger.warning(f'资源包 {name} 增量补丁清单解析失败，将由常规更新补齐')
+                continue
+            targets.append({'pack': name, 'entry': entry, 'manifest': manifest})
+        if not targets:
+            logger.info('没有可用的官方增量补丁，将使用常规更新')
+            return
+        self.patch_targets = targets
         self.support_incremental_patching = True
-        self.target_patch = target_patch
-        self.resources_base_path_patch = self.target_patch[0]['baseUrl']
-        indexfile_uri = target_patch[0]['indexFile']
-        self.gamefile_index_patch = self.get_result(urljoin(self.cdn_node, indexfile_uri))
+        logger.info(f'启用官方增量补丁更新: {[target["pack"] for target in targets]}')
     
     def set_progress_callback(self, callback):
         self.progress_callback = callback
@@ -830,7 +1032,7 @@ class Launcher:
         logger.info("Launching game...")
         if os.name == "nt":
             game_exe = self.game_folder_path / "Wuthering Waves.exe"
-            self.game_process = subprocess.Popen(f'"{game_exe}" {GAME_QUALITY_PARAM}', shell=True)
+            self.game_process = subprocess.Popen(f'"{game_exe}" -krqlv={self.get_download_quality()}', shell=True)
         if os.name == "posix":
             base_dir = os.path.dirname(sys.argv[0])
             
@@ -879,9 +1081,9 @@ class Launcher:
                     proton_path,
                     "waitforexitandrun",
                     game_exe_path,
-                    GAME_QUALITY_PARAM
+                    f"-krqlv={self.get_download_quality()}"
                 ])
-                logger.info(f"Launched game with Proton: {proton_path} run {game_exe_path} {GAME_QUALITY_PARAM}")
+                logger.info(f"Launched game with Proton: {proton_path} run {game_exe_path}")
             except Exception as e:
                 logger.error(f"Failed to launch game with Proton: {e}")
                 
