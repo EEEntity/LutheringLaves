@@ -284,6 +284,9 @@ class MainWindow(QMainWindow):
         logger.info("Settings button clicked")
         settings_window = SettingsWindow(self, launcher=self.launcher)
         settings_window.exec()
+        if self.launcher.state in (LauncherState.STARTGAME, LauncherState.NEEDINSTALL, LauncherState.NEEDUPDATE):
+            self.launcher.init_launcher_state()
+            self.init_launcher_state()
 
     def action_button_clicked(self):
         logger.info(f"Action button clicked. Current state: {self.launcher.state}")
