@@ -100,6 +100,7 @@ class Launcher:
         self.resources_base_path_patch = None
         self.krdiff_file_path = None
         self.progress_callback = None
+        self.downloaded_bytes = 0
         self.chunk_md5_cache = {}
         
         self.init_launcher_state()
@@ -500,6 +501,7 @@ class Launcher:
                             break
                         file.write(chunk)
                         downloaded_bytes += len(chunk)
+                        self.downloaded_bytes += len(chunk)
                         self.update_progress(flag=flag, value=len(chunk))
                         if total_size > 0:
                             percent = (downloaded_bytes / total_size) * 100
@@ -569,6 +571,7 @@ class Launcher:
                         break
                     f.write(data)
                     got += len(data)
+                    self.downloaded_bytes += len(data)
                     remaining -= len(data)
                     self.update_progress(flag=flag, value=0)
                 if remaining > 0:
