@@ -51,7 +51,7 @@ class DownloadWorker(QThread):
             self.download_progress.emit(mutil_progress[flag])
         elif flag == "verify":
             self.verify_progress.emit(mutil_progress[flag])
-        elif flag == "update":
+        elif flag in ("update", "update_patch"):
             self.update_progress.emit(mutil_progress[flag])
     
     def run(self):
@@ -68,7 +68,11 @@ class DownloadWorker(QThread):
                 self.download_finished.emit()
             if self.launcher.state == LauncherState.NEEDUPDATE:
                 logger.info("Starting game update...")
-                self.launcher.update_game()
+                if self.launcher.support_incremental_patching:
+                    logger.info("Incremental patching supported, patching...")
+                    self.launcher.update_game_with_patch()
+                else:
+                    self.launcher.update_game()
                 logger.info("Verifying game files after update...")
                 self.launcher.verify_gamefile()
                 self.launcher.state = LauncherState.STARTGAME
@@ -188,7 +192,10 @@ class MainWindow(QMainWindow):
             self.action_button.setText('下载游戏')
             self.action_button.setEnabled(True)
         if self.launcher.state == LauncherState.NEEDUPDATE:
-            self.action_button.setText('更新游戏')
+            if self.launcher.support_incremental_patching:
+                self.action_button.setText('增量更新')
+            else:
+                self.action_button.setText('更新游戏')
             self.action_button.setEnabled(True)
 
             

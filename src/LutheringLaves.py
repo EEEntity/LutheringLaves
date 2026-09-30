@@ -393,6 +393,7 @@ class Launcher:
                 if file_path.exists():
                     file_path.chmod(file_path.stat().st_mode | 0o111)
     def update_game_with_patch(self):
+        self.state = LauncherState.UPDATING
         try:
             self.download_patch()
             self.merge_patch()
@@ -964,5 +965,6 @@ if __name__ == '__main__':
     
     # Incremental updates
     if args.mode == 'patch-update':
-        launcher.download_patch()
-        launcher.merge_patch()
+        launcher.update_game_with_patch()
+        launcher.verify_gamefile()
+        launcher.update_localVersion()
