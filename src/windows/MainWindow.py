@@ -51,7 +51,7 @@ class DownloadWorker(QThread):
             self.download_progress.emit(mutil_progress[flag])
         elif flag == "verify":
             self.verify_progress.emit(mutil_progress[flag])
-        elif flag == "update":
+        elif flag in ("update", "update_patch"):
             self.update_progress.emit(mutil_progress[flag])
     
     def run(self):
@@ -68,7 +68,11 @@ class DownloadWorker(QThread):
                 self.download_finished.emit()
             if self.launcher.state == LauncherState.NEEDUPDATE:
                 logger.info("Starting game update...")
-                self.launcher.update_game()
+                if self.launcher.support_incremental_patching:
+                    logger.info("Incremental patching supported, patching...")
+                    self.launcher.update_game_with_patch()
+                else:
+                    self.launcher.update_game()
                 logger.info("Verifying game files after update...")
                 self.launcher.verify_gamefile()
                 self.launcher.state = LauncherState.STARTGAME
@@ -188,7 +192,10 @@ class MainWindow(QMainWindow):
             self.action_button.setText('下载游戏')
             self.action_button.setEnabled(True)
         if self.launcher.state == LauncherState.NEEDUPDATE:
-            self.action_button.setText('更新游戏')
+            if self.launcher.support_incremental_patching:
+                self.action_button.setText('增量更新')
+            else:
+                self.action_button.setText('更新游戏')
             self.action_button.setEnabled(True)
 
             
@@ -326,24 +333,26 @@ class MainWindow(QMainWindow):
             self.action_button.setText("继续")
             return
 
+    def format_progress_text(self, prefix, info: ProgressInfo):
+        finished_size = info.finished_size
+        total_size = info.total_size
+        downloaded = getattr(self.launcher, 'downloaded_bytes', 0)
+        return (f"{prefix} {finished_size / 1024 / 1024 / 1024:.1f}GB / {total_size / 1024 / 1024 / 1024:.1f}GB"
+                f"（实际下载 {downloaded / 1024 / 1024 / 1024:.2f}GB）")
     def download_progress_ui(self, info: ProgressInfo):
         if self.worker.is_paused():
             self.action_button.setText("继续")
             return
         self.action_button.setText("暂停")
         self.info_label.setVisible(True)
-        finished_size = info.finished_size
-        total_size = info.total_size
-        self.info_label.setText(f"已下载 {finished_size / 1024 / 1024 / 1024:.1f}GB / {total_size / 1024 / 1024 /1024:.1f}GB")
+        self.info_label.setText(self.format_progress_text("已下载", info))
     
     def verify_progress_ui(self, info: ProgressInfo):
         if self.worker.is_paused():
             self.action_button.setText("继续")
             return
         self.info_label.setVisible(True)
-        finished_size = info.finished_size
-        total_size = info.total_size
-        self.info_label.setText(f"已校验 {finished_size / 1024 / 1024 / 1024:.1f}GB / {total_size / 1024 / 1024 /1024:.1f}GB")
+        self.info_label.setText(self.format_progress_text("已校验", info))
         
     def update_progress_ui(self, info: ProgressInfo):
         if self.worker.is_paused():
@@ -351,9 +360,7 @@ class MainWindow(QMainWindow):
             return
         self.action_button.setText("暂停")
         self.info_label.setVisible(True)
-        finished_size = info.finished_size
-        total_size = info.total_size
-        self.info_label.setText(f"已更新 {finished_size / 1024 / 1024 / 1024:.1f}GB / {total_size / 1024 / 1024 /1024:.1f}GB")
+        self.info_label.setText(self.format_progress_text("已更新", info))
     
     def download_finished_ui(self):
         logger.info("Download finished. Ready to launch game.")
