@@ -31,6 +31,7 @@ WW_LAUNCHER_DOWNLOAD_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/laun
 WW_LAUNCHER_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json'
 LOCAL_MD5_CHUNK_SIZE = 4 * 1024 * 1024
 PATCH_STREAM_MEMORY_LIMIT = 4 * 1024 ** 3
+GAME_QUALITY_PARAM = '-krqlv=hd'
 
 class LauncherState(Enum):
     STARTGAME = 0
@@ -828,8 +829,8 @@ class Launcher:
     def start_game_process(self):
         logger.info("Launching game...")
         if os.name == "nt":
-            game_exe = self.launcher.game_folder_path / "Wuthering Waves.exe"
-            self.game_process = subprocess.Popen(f'"{game_exe}"', shell=True)
+            game_exe = self.game_folder_path / "Wuthering Waves.exe"
+            self.game_process = subprocess.Popen(f'"{game_exe}" {GAME_QUALITY_PARAM}', shell=True)
         if os.name == "posix":
             base_dir = os.path.dirname(sys.argv[0])
             
@@ -877,9 +878,10 @@ class Launcher:
                 self.game_process = subprocess.Popen([
                     proton_path,
                     "waitforexitandrun",
-                    game_exe_path
+                    game_exe_path,
+                    GAME_QUALITY_PARAM
                 ])
-                logger.info(f"Launched game with Proton: {proton_path} run {game_exe_path}")
+                logger.info(f"Launched game with Proton: {proton_path} run {game_exe_path} {GAME_QUALITY_PARAM}")
             except Exception as e:
                 logger.error(f"Failed to launch game with Proton: {e}")
                 
