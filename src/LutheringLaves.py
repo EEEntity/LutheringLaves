@@ -30,6 +30,7 @@ logger.info(f"base dir: {base_dir}")
 WW_LAUNCHER_DOWNLOAD_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/launcher/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/G152/index.json'
 WW_LAUNCHER_API = 'https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json'
 LOCAL_MD5_CHUNK_SIZE = 4 * 1024 * 1024
+PATCH_STREAM_MEMORY_LIMIT = 4 * 1024 ** 3
 
 class LauncherState(Enum):
     STARTGAME = 0
@@ -98,7 +99,6 @@ class Launcher:
         self.target_patch = None
         self.gamefile_index_patch = None
         self.resources_base_path_patch = None
-        self.krdiff_file_path = None
         self.progress_callback = None
         self.downloaded_bytes = 0
         self.chunk_md5_cache = {}
@@ -266,49 +266,149 @@ class Launcher:
             self.update_game_progress.finished_count += 1
     
     def download_patch(self):
-        
+        if not self.gamefile_index_patch:
+            raise RuntimeError('增量补丁不可用')
+        # 硬盘空间检查
+        required = 0
+        if self.target_patch:
+            ext = self.target_patch[0].get('ext') or {}
+            required = int(ext.get('requiredDiskSpace') or 0)
+        if required > 0:
+            free = shutil.disk_usage(str(self.game_folder_path)).free
+            if free < required:
+                required_gib = required / 1024 ** 3
+                free_gib = free / 1024 ** 3
+                raise RuntimeError(f'磁盘空间不足: 更新需要 {required_gib:.2f} GiB, 当前可用 {free_gib:.2f} GiB')
         self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
         if not self.temp_folder_path.exists():
             self.temp_folder_path.mkdir()
-        
-        krdiff_file_path = None
-        
-        for i, file in enumerate(self.gamefile_index_patch['resource']):
-            length = len(self.game_folder_path['resource'])
+        resource_list = self.gamefile_index_patch.get('resource', [])
+        length = len(resource_list)
+        self.update_game_progress_patch.total_count = length
+        self.update_game_progress_patch.total_size = 0
+        for file in resource_list:
+            self.update_game_progress_patch.total_size += int(file['size'])
+        for i, file in enumerate(resource_list):
+            file_size = int(file['size'])
             if 'fromFolder' in file:
-                download_url = urljoin(self.cdn_node, file['fromFolder'] + "/" + file['dest'])
-                download_url = quote(download_url, safe=':/')
+                base = file['fromFolder']
+                if not base.endswith('/'):
+                    base += '/'
+                download_url = urljoin(self.cdn_node, base + file['dest'])
+                file_path = self.game_folder_path.joinpath(Path(file['dest']))
+            else:
+                base = self.resources_base_path_patch
+                if not base.endswith('/'):
+                    base += '/'
+                download_url = urljoin(self.cdn_node, base + file['dest'])
                 file_path = self.temp_folder_path.joinpath(Path(file['dest']))
-                logger.info(f"Downloading file {i+1}/{length}: {file_path}")
-                self.download_file_with_resume(url=download_url, file_path=file_path)
-                continue
-            
-            download_url = urljoin(self.cdn_node,  self.resources_base_path_patch + "/" + file['dest'])
             download_url = quote(download_url, safe=':/')
-            krdiff_file_path = Path(base_dir) / Path(file['dest'])
-            logger.info(f"Downloading file {i+1}/{length}: {krdiff_file_path}")
-            self.download_file_with_resume(url=download_url, file_path=krdiff_file_path)
-    
+            logger.info(f'Downloading patch resource {i+1}/{length}: {file_path}')
+            if not self.download_file_with_resume(
+                url=download_url,
+                file_path=file_path,
+                flag='update_patch',
+                file_size=file_size
+            ):
+                raise RuntimeError(f'补丁资源下载失败: {file_path}')
+            self.update_game_progress_patch.finished_count += 1
+
     def merge_patch(self):
-        
-        if self.krdiff_file_path:
-            self.run_hpatchz(self.krdiff_file_path, self.game_folder_path, self.temp_folder_path)
-            
-            for item in self.temp_folder_path.rglob('*'):
-                relative_path = item.relative_to(self.temp_folder_path)
-                destination = self.game_folder_path / relative_path
-                
-                if destination.exists():
-                    if destination.is_file():
-                        destination.unlink()
-                    else:
-                        shutil.rmtree(str(destination))
-                
-                shutil.move(str(item), str(destination))
-                
-            shutil.rmtree(str(self.temp_folder_path))
-            self.krdiff_file_path.unlink()
-    
+        if not self.gamefile_index_patch:
+            raise RuntimeError('增量补丁清单不可用')
+        if not self.temp_folder_path:
+            self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
+        group_infos = self.gamefile_index_patch.get('groupInfos', [])
+        length = len(group_infos)
+        for i, group in enumerate(group_infos):
+            group_dest = group['dest']
+            patch_path = self.temp_folder_path.joinpath(Path(group_dest))
+            if not patch_path.exists():
+                raise RuntimeError(f'缺少组补丁文件: {patch_path}')
+            logger.info(f'Applying patch group {i+1}/{length}: {group_dest}')
+            self.apply_group_patch(patch_path, group)
+        # 删除清单
+        for rel in self.gamefile_index_patch.get('deleteFiles', []):
+            target = self.game_folder_path.joinpath(Path(rel))
+            if target.exists():
+                logger.info(f'Deleting obsolete file: {rel}')
+                target.unlink()
+        # 清理临时目录
+        if self.temp_folder_path and self.temp_folder_path.exists():
+            shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
+        self.temp_folder_path = None
+
+    def apply_group_patch(self, patch_path, group):
+        try:
+            from . import krpdiff
+        except ImportError:
+            import krpdiff
+        patch = krpdiff.parse_dir_patch(patch_path.read_bytes())
+        total_stream = patch.old_stream_size + patch.new_stream_size
+        if total_stream > PATCH_STREAM_MEMORY_LIMIT:
+            total_gib = total_stream / 1024 ** 3
+            raise RuntimeError(f'组补丁数据量过大({total_gib:.2f} GiB)，回退全量更新')
+        src_md5 = {f['dest']: f['md5'] for f in group.get('srcFiles', [])}
+        dst_info = {f['dest']: (f['md5'], int(f['size'])) for f in group.get('dstFiles', [])}
+        dst_chunk_infos = {f['dest']: f.get('chunkInfos') for f in group.get('dstFiles', [])}
+        def read_old(rel_path):
+            file_path = self.game_folder_path.joinpath(Path(rel_path))
+            data = file_path.read_bytes()
+            expect_md5 = src_md5.get(rel_path)
+            if expect_md5 and hashlib.md5(data).hexdigest() != expect_md5:
+                raise krpdiff.KrpdiffError(f'旧文件 MD5 不符: {rel_path}')
+            return data
+        for new_path, content in patch.apply(read_old):
+            expect = dst_info.get(new_path)
+            if expect:
+                if len(content) != expect[1] or hashlib.md5(content).hexdigest() != expect[0]:
+                    raise krpdiff.KrpdiffError(f'补丁输出 MD5 不符: {new_path}')
+            else:
+                logger.warning(f'补丁输出未在清单中登记: {new_path}')
+            file_path = self.game_folder_path.joinpath(Path(new_path))
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(content)
+            chunk_infos = dst_chunk_infos.get(new_path)
+            if chunk_infos:
+                self.cache_chunks_md5(file_path, chunk_infos)
+        for copy in patch.copy_files:
+            src_path = self.game_folder_path.joinpath(Path(copy.old_path))
+            dst_path = self.game_folder_path.joinpath(Path(copy.new_path))
+            if src_path == dst_path:
+                continue
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(src_path), str(dst_path))
+        # 空文件与目录
+        for rel in patch.empty_files:
+            file_path = self.game_folder_path.joinpath(Path(rel))
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(b'')
+        for rel in patch.new_dirs:
+            if rel:
+                self.game_folder_path.joinpath(Path(rel)).mkdir(parents=True, exist_ok=True)
+        # 可执行位
+        if patch.execute_files and os.name == 'posix':
+            for rel in patch.execute_files:
+                file_path = self.game_folder_path.joinpath(Path(rel))
+                if file_path.exists():
+                    file_path.chmod(file_path.stat().st_mode | 0o111)
+    def update_game_with_patch(self):
+        try:
+            self.download_patch()
+            self.merge_patch()
+            logger.info('组补丁增量更新完成')
+            return True
+        except Exception as e:
+            logger.exception(f'组补丁增量更新失败，回退到常规更新流程: {e}')
+            try:
+                if self.temp_folder_path and self.temp_folder_path.exists():
+                    shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
+                self.temp_folder_path = None
+            except Exception:
+                pass
+            self.update_game()
+            return False
+
     def verify_gamefile(self):
         self.state = LauncherState.VALIDATING
         resource_list = list(self.gamefile_index['resource'])
@@ -660,30 +760,6 @@ class Launcher:
         except Exception as e:
             logger.error(f'Chunk update error for {file_path}: {str(e)}')
             return -1
-    
-    def download_patch_tool(self):
-        
-        if os.name == "nt":
-            tool_url = "https://gitee.com/tiz/LutheringLaves/raw/main/tools/hpatchz.exe"
-            file_name = Path(base_dir) / Path("tools") / "hpatchz.exe"
-        if os.name == "posix":
-            tool_url = "https://gitee.com/tiz/LutheringLaves/raw/main/tools/hpatchz"
-            file_name = Path(base_dir) / Path("tools") / "hpatchz"
-            
-        if not self.download_file_with_resume(tool_url, file_name): return False
-        
-        if os.name == "posix":
-            os.system(f"chmod +x {str(file_name)}")
-        
-        return True
-    
-    def run_hpatchz(self,patch_path, original_path, output_path):
-        self.download_patch_tool()
-        if os.name == "nt":
-            cmd = f'tools\hpatchz.exe "{original_path}" {patch_path} "{output_path}" -f'
-        if os.name == "posix":
-            cmd = f'tools/hpatchz "{original_path}" {patch_path} "{output_path}" -f'
-        os.system(cmd)
 
     def is_support_incremental_patching(self):
         if not self.local_version: return False
