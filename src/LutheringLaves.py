@@ -44,6 +44,7 @@ QUALITY_NAMES = {
     'hd': '高清(HD)',
     'sd': '流畅(SD)',
 }
+PATCH_APPLIED_FILE = 'applied.json'
 
 class _NotifyWriter:
     __slots__ = ('_writer', '_notify', '_pending')
@@ -452,6 +453,53 @@ class Launcher:
             )
             progress.finished_count += 1
     
+    def patch_temp_path(self) -> Path:
+        if not self.temp_folder_path:
+            self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
+        return self.temp_folder_path
+
+    def load_applied_groups(self) -> set:
+        cached = getattr(self, '_applied_groups', None)
+        if cached is not None:
+            return cached
+        applied = set()
+        try:
+            path = self.patch_temp_path() / PATCH_APPLIED_FILE
+            applied = {(item['pack'], item['dest']) for item in json.loads(path.read_text(encoding='utf-8'))}
+        except (OSError, ValueError, TypeError, KeyError):
+            applied = set()
+        self._applied_groups = applied
+        return applied
+
+    def mark_group_applied(self, pack, dest) -> None:
+        applied = set(self.load_applied_groups())
+        applied.add((pack, dest))
+        self._applied_groups = applied
+        path = self.patch_temp_path() / PATCH_APPLIED_FILE
+        temp = path.with_name(path.name + '.tmp')
+        temp.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(
+            json.dumps([{'pack': pack_, 'dest': dest_} for pack_, dest_ in sorted(applied)]),
+            encoding='utf-8'
+        )
+        os.replace(temp, path)
+
+    def group_applied(self, pack, group) -> bool:
+        if (pack, group['dest']) not in self.load_applied_groups():
+            return False
+        for file in group.get('dstFiles') or []:
+            try:
+                size = self.game_folder_path.joinpath(Path(file['dest'])).stat().st_size
+            except OSError:
+                return False
+            if size != int(file['size']):
+                return False
+        return True
+
+    def applied_group_dests(self, target) -> set:
+        return {group['dest'] for group in target['manifest'].get('groupInfos', [])
+                if self.group_applied(target['pack'], group)}
+
     def download_patch(self, on_resource_done=None):
         if not self.patch_targets:
             raise RuntimeError('增量补丁不可用')
@@ -473,7 +521,10 @@ class Launcher:
         patch_count = 0
         patch_size = 0
         for target in self.patch_targets:
+            skip_dests = self.applied_group_dests(target)
             for file in target['manifest'].get('resource', []):
+                if file['dest'] in skip_dests:
+                    continue
                 patch_count += 1
                 patch_size += int(file['size'])
         if not progress.total_size:
@@ -489,8 +540,12 @@ class Launcher:
             if pack_base and not pack_base.endswith('/'):
                 pack_base += '/'
             resource_list = target['manifest'].get('resource', [])
+            skip_dests = self.applied_group_dests(target)
             for file in resource_list:
                 file_size = int(file['size'])
+                if file['dest'] in skip_dests:
+                    logger.info(f'补丁组 {file["dest"]} 上次已应用，跳过下载')
+                    continue
                 if 'fromFolder' in file:
                     base = file['fromFolder']
                     if not base.endswith('/'):
@@ -546,6 +601,10 @@ class Launcher:
             length = len(group_infos)
             for i, group in enumerate(group_infos):
                 group_dest = group['dest']
+                if self.group_applied(pack, group):
+                    logger.info(f'补丁组 {i+1}/{length} 上次已应用，跳过: {group_dest}')
+                    self.patch_covered_dests.update(f['dest'] for f in group.get('dstFiles', []))
+                    continue
                 if wait_group_ready is not None and not wait_group_ready(pack, group_dest):
                     logger.warning('组补丁应用已中止（下载失败）')
                     return self.patch_covered_dests
@@ -555,6 +614,7 @@ class Launcher:
                 logger.info(f'Applying patch group {i+1}/{length} [{pack}]: {group_dest}')
                 produced = self.apply_group_patch(patch_path, group)
                 self.patch_covered_dests |= produced or set()
+                self.mark_group_applied(pack, group_dest)
                 patch_path.unlink(missing_ok=True)
             for rel in target['manifest'].get('deleteFiles', []):
                 delete_path = self.game_folder_path.joinpath(Path(rel))
@@ -565,6 +625,7 @@ class Launcher:
         if self.temp_folder_path and self.temp_folder_path.exists():
             shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
         self.temp_folder_path = None
+        self._applied_groups = None
         return self.patch_covered_dests
 
     def sync_patch(self) -> set:
@@ -699,7 +760,10 @@ class Launcher:
         covered = set()
         for target in self.patch_targets:
             manifest = target['manifest']
+            skip_dests = self.applied_group_dests(target)
             for file in manifest.get('resource', []):
+                if file['dest'] in skip_dests:
+                    continue
                 patch_bytes += int(file['size'])
                 patch_count += 1
                 if 'fromFolder' in file:
@@ -747,6 +811,7 @@ class Launcher:
                     if self.temp_folder_path and self.temp_folder_path.exists():
                         shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
                     self.temp_folder_path = None
+                    self._applied_groups = None
                 except Exception:
                     pass
         if used_patch:
@@ -758,6 +823,36 @@ class Launcher:
         else:
             self.update_game() # again
         return used_patch
+
+    def verify_one_file(self, file):
+        file_path = self.game_folder_path.joinpath(Path(file['dest']))
+        download_url = self.build_download_url(file['dest'])
+        if not file_path.exists():
+            logger.warning(f'{file_path} not found, downloading whole file')
+            ok = self.download_file_with_resume(url=download_url, file_path=file_path, flag='verify')
+            if not ok or self.get_file_md5(file_path) != file['md5']:
+                self.verify_failures.append(file['dest'])
+                logger.error(f'{file_path} 校验失败')
+            return
+        # 有 chunkInfos 的文件分块校验/修复
+        if file.get('chunkInfos'):
+            if self.update_file_by_chunks(download_url, file_path, file, flag='verify') >= 0:
+                return
+
+        current_md5 = self.get_file_md5(file_path)
+
+        if current_md5 == file['md5']:
+            logger.info(f'{file_path} MD5 match')
+            return
+
+        logger.warning(f'{file_path} MD5 mismatch (expected: {file["md5"]}, got: {current_md5})')
+        self.download_file_with_resume(url=download_url, file_path=file_path, overwrite=True, flag='verify')
+
+        if self.get_file_md5(file_path) == file['md5']:
+            logger.info(f'{file_path} MD5 OK after re-download')
+        else:
+            logger.error(f'{file_path} Still MD5 mismatch after re-download')
+            self.verify_failures.append(file['dest'])
 
     def verify_gamefile(self):
         self.state = LauncherState.VALIDATING
@@ -788,55 +883,12 @@ class Launcher:
                         remove_file.unlink()
     
         for file in resource_list:
-            file_path = self.game_folder_path.joinpath(Path(file['dest']))
             file_size = int(file['size'])
-            download_url = self.build_download_url(file['dest'])
-            if not file_path.exists():
-                logger.warning(f'{file_path} not found, downloading whole file')
-                ok = self.download_file_with_resume(
-                    url=download_url,
-                    file_path=file_path
-                )
-                if not ok or self.get_file_md5(file_path) != file['md5']:
-                    self.verify_failures.append(file['dest'])
-                    logger.error(f'{file_path} 校验失败')
-                self.update_progress(
-                    flag='verify',
-                    value=file_size
-                )
-                continue
-            # 有 chunkInfos 的文件分块校验/修复
-            if file.get('chunkInfos'):
-                downloaded = self.update_file_by_chunks(
-                    download_url,
-                    file_path,
-                    file,
-                    flag='verify'
-                )
-                if downloaded >= 0:
-                    self.update_progress(
-                        flag='verify',
-                        value=file_size
-                    )
-                    continue
-
-            current_md5 = self.get_file_md5(file_path)
-
-            if current_md5 == file['md5']:
-                logger.info(f'{file_path} MD5 match')
-                self.update_progress(flag='verify',value=int(file['size']))
-                continue
-            
-            logger.warning(f'{file_path} MD5 mismatch (expected: {file["md5"]}, got: {current_md5})')
-            self.download_file_with_resume(url=download_url, file_path=file_path, overwrite=True)
-            
-            current_md5 = self.get_file_md5(file_path)
-            if current_md5 == file['md5']:
-                logger.info(f'{file_path} MD5 OK after re-download')
-            else:
-                logger.error(f'{file_path} Still MD5 mismatch after re-download')
-                self.verify_failures.append(file['dest'])
-            self.update_progress(flag='verify',value=int(file['size']))
+            before = self.verify_game_progress.finished_size
+            self.verify_one_file(file)
+            counted = self.verify_game_progress.finished_size - before
+            if file_size > counted:
+                self.update_progress(flag='verify', value=file_size - counted)
 
         if self.verify_failures:
             logger.error(f'有 {len(self.verify_failures)} 个文件校验失败，本次不写入版本号，避免把不完整安装标记为最新')
@@ -1061,11 +1113,14 @@ class Launcher:
                             percent = (downloaded_bytes / total_size) * 100
                             logger.info(f"{file_path} size:{total_size/1024/1024:.1f} MB {percent:.1f}%")
             
+            if total_size > 0 and downloaded_bytes < total_size:
+                logger.warning(f'{file_path} 传输中断（{downloaded_bytes}/{total_size} 字节），保留 .temp 便于续传')
+                return False
             shutil.move(temp_file_path, file_path)
             return True
         except Exception as e:
             logger.error(f"Download error: {str(e)}")
-            if e.code == 416 and downloaded_bytes == content_length:
+            if getattr(e, 'code', None) == 416 and downloaded_bytes == content_length:
                 if temp_file_path.exists(): 
                     shutil.move(temp_file_path, file_path)
             return False
@@ -1220,6 +1275,8 @@ class Launcher:
         bad_size = []
         checked = 0
         for group in manifest.get('groupInfos', []):
+            if self.group_applied(name, group):
+                continue
             for file in group.get('srcFiles', []):
                 checked += 1
                 file_path = self.game_folder_path.joinpath(Path(file['dest']))
