@@ -8,6 +8,7 @@ import io
 import argparse
 import logging
 import subprocess
+import threading
 from enum import Enum
 from pathlib import Path
 from urllib.request import urlopen, Request, HTTPError
@@ -35,6 +36,7 @@ WW_RESOURCE_INDEX_HOSTS = (
 )
 WW_RESOURCE_INDEX_PATH = 'launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json'
 LOCAL_MD5_CHUNK_SIZE = 4 * 1024 * 1024
+PATCH_NOTIFY_INTERVAL = 64 * 1024 * 1024
 QUALITY_LEVELS = ('uhd', 'hd', 'sd')
 DEFAULT_QUALITY = 'hd'
 QUALITY_NAMES = {
@@ -42,6 +44,28 @@ QUALITY_NAMES = {
     'hd': '高清(HD)',
     'sd': '流畅(SD)',
 }
+
+class _NotifyWriter:
+    __slots__ = ('_writer', '_notify', '_pending')
+
+    def __init__(self, writer, notify):
+        self._writer = writer
+        self._notify = notify
+        self._pending = 0
+
+    def __enter__(self):
+        self._writer.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._writer.__exit__(exc_type, exc, tb)
+
+    def write(self, data: bytes) -> None:
+        self._writer.write(data)
+        self._pending += len(data)
+        if self._pending >= PATCH_NOTIFY_INTERVAL:
+            self._pending = 0
+            self._notify()
 
 class LauncherState(Enum):
     STARTGAME = 0
@@ -428,7 +452,7 @@ class Launcher:
             )
             progress.finished_count += 1
     
-    def download_patch(self):
+    def download_patch(self, on_resource_done=None):
         if not self.patch_targets:
             raise RuntimeError('增量补丁不可用')
         # 硬盘空间检查
@@ -442,8 +466,9 @@ class Launcher:
                     free_gib = free / 1024 ** 3
                     raise RuntimeError(f'磁盘空间不足: 更新需要 {required_gib:.2f} GiB, 当前可用 {free_gib:.2f} GiB')
         self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
-        if not self.temp_folder_path.exists():
-            self.temp_folder_path.mkdir()
+        temp_root = self.temp_folder_path
+        if not temp_root.exists():
+            temp_root.mkdir()
         progress = self.update_game_progress_patch
         patch_count = 0
         patch_size = 0
@@ -457,7 +482,7 @@ class Launcher:
         done = 0
         for target in self.patch_targets:
             pack = target['pack']
-            pack_temp = self.temp_folder_path / pack
+            pack_temp = temp_root / pack
             if not pack_temp.exists():
                 pack_temp.mkdir()
             pack_base = target['entry'].get('baseUrl') or ''
@@ -489,6 +514,8 @@ class Launcher:
                     self.verify_patch_file(file_path, file, download_url)
                     self.patch_covered_dests.add(file['dest'])
                 progress.finished_count += 1
+                if on_resource_done is not None:
+                    on_resource_done(pack, file['dest'])
 
     def verify_patch_file(self, file_path, file_info, download_url):
         """校验文件"""
@@ -507,7 +534,7 @@ class Launcher:
         if self.get_file_md5(file_path) != expect_md5:
             raise RuntimeError(f'补丁资源校验失败: {file_path}')
 
-    def merge_patch(self) -> set:
+    def merge_patch(self, wait_group_ready=None) -> set:
         if not self.patch_targets:
             raise RuntimeError('增量补丁清单不可用')
         if not self.temp_folder_path:
@@ -519,12 +546,16 @@ class Launcher:
             length = len(group_infos)
             for i, group in enumerate(group_infos):
                 group_dest = group['dest']
+                if wait_group_ready is not None and not wait_group_ready(pack, group_dest):
+                    logger.warning('组补丁应用已中止（下载失败）')
+                    return self.patch_covered_dests
                 patch_path = pack_temp.joinpath(Path(group_dest))
                 if not patch_path.exists():
                     raise RuntimeError(f'缺少组补丁文件: {patch_path}')
                 logger.info(f'Applying patch group {i+1}/{length} [{pack}]: {group_dest}')
                 produced = self.apply_group_patch(patch_path, group)
                 self.patch_covered_dests |= produced or set()
+                patch_path.unlink(missing_ok=True)
             for rel in target['manifest'].get('deleteFiles', []):
                 delete_path = self.game_folder_path.joinpath(Path(rel))
                 if delete_path.exists():
@@ -534,6 +565,56 @@ class Launcher:
         if self.temp_folder_path and self.temp_folder_path.exists():
             shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
         self.temp_folder_path = None
+        return self.patch_covered_dests
+
+    def sync_patch(self) -> set:
+        if not self.patch_targets:
+            raise RuntimeError('增量补丁不可用')
+        groups = [(target['pack'], group['dest']) for target in self.patch_targets
+                  for group in target['manifest'].get('groupInfos', [])]
+        ready = {key: threading.Event() for key in groups}
+        failure = []
+        abort = threading.Event()
+        download_done = threading.Event()
+
+        def resource_done(pack, dest):
+            if failure:
+                raise failure[0]
+            event = ready.get((pack, dest))
+            if event is not None:
+                event.set()
+
+        def wait_group_ready(pack, dest):
+            event = ready.get((pack, dest))
+            if event is None:
+                return True  # 不在下载清单里，交给 merge_patch 自行报错
+            while not event.wait(0.5):
+                if abort.is_set():
+                    return False
+                if download_done.is_set():
+                    raise RuntimeError(f'组补丁未下载完成: {dest}')
+            return True
+
+        def applier():
+            try:
+                self.merge_patch(wait_group_ready=wait_group_ready)
+            except BaseException as e:
+                failure.append(e)
+                abort.set()
+
+        logger.info(f'边下载边应用: {len(groups)} 个组补丁')
+        thread = threading.Thread(target=applier, name='patch-applier', daemon=True)
+        thread.start()
+        try:
+            self.download_patch(on_resource_done=resource_done)
+        except BaseException:
+            abort.set()
+            raise
+        finally:
+            download_done.set()
+            thread.join()
+        if failure:
+            raise failure[0]
         return self.patch_covered_dests
 
     def apply_group_patch(self, patch_path, group) -> set:
@@ -568,11 +649,12 @@ class Launcher:
             if expect is None:
                 logger.warning(f'补丁输出未在清单中登记: {rel_path}')
             target = game_dir.joinpath(Path(rel_path))
-            return krpdiff.PatchWriter(
+            writer = krpdiff.PatchWriter(
                 target,
                 expect[1] if expect else size,
                 expect[0] if expect else None,
             )
+            return _NotifyWriter(writer, self.notify_progress)
 
         with open(patch_path, 'rb') as patch_file:
             patch = krpdiff.parse_dir_patch(patch_file)
@@ -655,8 +737,7 @@ class Launcher:
                 % (total_bytes / 1024 ** 3, plan['patch_bytes'] / 1024 ** 3, plan['extra_bytes'] / 1024 ** 3)
             )
             try:
-                self.download_patch()
-                self.merge_patch()
+                self.sync_patch()
                 used_patch = True
                 logger.info(f'组补丁增量更新完成，已覆盖 {len(self.patch_covered_dests)} 个文件')
             except Exception as e:
@@ -1204,7 +1285,19 @@ class Launcher:
     
     def set_progress_callback(self, callback):
         self.progress_callback = callback
-    
+
+    def notify_progress(self, flag='update_patch'):
+        if self.progress_callback:
+            self.progress_callback(self._progress_snapshot(), flag)
+
+    def _progress_snapshot(self):
+        return {
+            "download": self.download_game_progress,
+            "verify": self.verify_game_progress,
+            "update": self.update_game_progress,
+            "update_patch": self.update_game_progress_patch,
+        }
+
     def update_progress(self, flag, value):
         if flag == "download":
             self.download_game_progress.finished_size += value
@@ -1220,15 +1313,8 @@ class Launcher:
             if progress.finished_size > progress.total_size:
                 progress.total_size = progress.finished_size
 
-        mutil_progress = {
-            "download": self.download_game_progress,
-            "verify": self.verify_game_progress,
-            "update": self.update_game_progress,
-            "update_patch": self.update_game_progress_patch,
-        }
-        
         if self.progress_callback:
-            self.progress_callback(mutil_progress, flag) 
+            self.progress_callback(self._progress_snapshot(), flag)
 
     def get_file_md5(self, file_path):
         md5_hash = hashlib.md5()
