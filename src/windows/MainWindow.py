@@ -57,12 +57,18 @@ class DownloadWorker(QThread):
     def run(self):
         try:
             logger.info(f"Worker started with state: {self.launcher.state}")
+            self.launcher.downloaded_bytes = 0
 
             if self.launcher.state == LauncherState.NEEDINSTALL:
                 logger.info("Starting game download...")
                 self.launcher.download_game()
                 logger.info("Verifying game files...")
                 self.launcher.verify_gamefile()
+                if self.launcher.has_verify_failures():
+                    failed = len(self.launcher.verify_failures)
+                    logger.error(f"Verify failed for {failed} files, keep state NEEDINSTALL")
+                    self.error.emit(f'有 {failed} 个文件校验失败，请重新点击下载')
+                    return
                 self.launcher.state = LauncherState.STARTGAME
                 logger.info("Download and verify finished.")
                 self.download_finished.emit()
@@ -75,6 +81,12 @@ class DownloadWorker(QThread):
                     self.launcher.update_game()
                 logger.info("Verifying game files after update...")
                 self.launcher.verify_gamefile()
+                if self.launcher.has_verify_failures():
+                    failed = len(self.launcher.verify_failures)
+                    logger.error(f"Verify failed for {failed} files, keep state NEEDUPDATE")
+                    self.launcher.state = LauncherState.NEEDUPDATE
+                    self.error.emit(f'有 {failed} 个文件校验失败，未写入版本号，请重新点击更新')
+                    return
                 self.launcher.state = LauncherState.STARTGAME
                 logger.info("Update and verify finished.")
                 self.download_finished.emit()
@@ -305,6 +317,7 @@ class MainWindow(QMainWindow):
             self.worker.download_progress.connect(self.download_progress_ui)
             self.worker.verify_progress.connect(self.verify_progress_ui)
             self.worker.download_finished.connect(self.download_finished_ui)
+            self.worker.error.connect(self.download_error)
             self.worker.start()
             return
             
@@ -314,6 +327,7 @@ class MainWindow(QMainWindow):
             self.worker.update_progress.connect(self.update_progress_ui)
             self.worker.verify_progress.connect(self.verify_progress_ui)
             self.worker.download_finished.connect(self.download_finished_ui)
+            self.worker.error.connect(self.download_error)
             self.worker.start()
             return
         
@@ -336,12 +350,15 @@ class MainWindow(QMainWindow):
             self.action_button.setText("继续")
             return
 
-    def format_progress_text(self, prefix, info: ProgressInfo):
+    def format_progress_text(self, prefix, info: ProgressInfo, show_traffic=True):
         finished_size = info.finished_size
         total_size = info.total_size
-        downloaded = getattr(self.launcher, 'downloaded_bytes', 0)
-        return (f"{prefix} {finished_size / 1024 / 1024 / 1024:.1f}GB / {total_size / 1024 / 1024 / 1024:.1f}GB"
-                f"（实际下载 {downloaded / 1024 / 1024 / 1024:.2f}GB）")
+        text = (f"{prefix} {finished_size / 1024 / 1024 / 1024:.2f}GB"
+                f" / {total_size / 1024 / 1024 / 1024:.2f}GB")
+        if show_traffic:
+            downloaded = getattr(self.launcher, 'downloaded_bytes', 0)
+            text += f"（实际下载 {downloaded / 1024 / 1024 / 1024:.2f}GB）"
+        return text
     def download_progress_ui(self, info: ProgressInfo):
         if self.worker.is_paused():
             self.action_button.setText("继续")
@@ -363,7 +380,7 @@ class MainWindow(QMainWindow):
             return
         self.action_button.setText("暂停")
         self.info_label.setVisible(True)
-        self.info_label.setText(self.format_progress_text("已更新", info))
+        self.info_label.setText(self.format_progress_text("已更新", info, show_traffic=False))
     
     def download_finished_ui(self):
         logger.info("Download finished. Ready to launch game.")
@@ -374,7 +391,9 @@ class MainWindow(QMainWindow):
     def download_error(self, error):
         logger.error(f"Download error: {error}")
         self.action_button.setEnabled(True)
-        self.action_button.setText("下载失败")
+        self.info_label.setVisible(True)
+        self.info_label.setText(str(error)[:40])
+        self.init_launcher_state()
     
     def monitor_game_process(self):
         if hasattr(self, 'game_process') and self.launcher:

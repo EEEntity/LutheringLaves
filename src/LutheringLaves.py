@@ -35,7 +35,6 @@ WW_RESOURCE_INDEX_HOSTS = (
 )
 WW_RESOURCE_INDEX_PATH = 'launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json'
 LOCAL_MD5_CHUNK_SIZE = 4 * 1024 * 1024
-PATCH_STREAM_MEMORY_LIMIT = 4 * 1024 ** 3
 QUALITY_LEVELS = ('uhd', 'hd', 'sd')
 DEFAULT_QUALITY = 'hd'
 QUALITY_NAMES = {
@@ -85,6 +84,7 @@ class Launcher:
                 break
         
         if self.launcher_info is None:
+            self.cdn_node = ''
             self.state = LauncherState.NETWORKERROR
             return
         
@@ -118,6 +118,8 @@ class Launcher:
         
         self.support_incremental_patching = False
         self.patch_targets = []
+        self.patch_covered_dests = set()
+        self.verify_failures = []
         self.progress_callback = None
         self.downloaded_bytes = 0
         self.chunk_md5_cache = {}
@@ -222,6 +224,34 @@ class Launcher:
             base += '/'
         return base
 
+    def cdn_candidates(self):
+        """按优先级排列的可用 CDN 节点"""
+        nodes = []
+        cdnlist = (self.launcher_info or {}).get('cdnList') or []
+        for node in sorted((n for n in cdnlist if n['K1'] == 1 and n['K2'] == 1),
+                           key=lambda n: n['P'], reverse=True):
+            if node['url'] not in nodes:
+                nodes.append(node['url'])
+        if self.cdn_node in nodes:
+            nodes.remove(self.cdn_node)
+            nodes.insert(0, self.cdn_node)
+        return nodes
+
+    def fetch_verified(self, path, expect_md5, what):
+        """从 CDN 获取文件并校验 md5"""
+        for node in self.cdn_candidates() or ([self.cdn_node] if self.cdn_node else []):
+            raw = self.get_result_bytes(urljoin(node, path))
+            if raw is None:
+                continue
+            if expect_md5 and hashlib.md5(raw).hexdigest() != expect_md5:
+                logger.warning(f'{what} 在 {node} 与索引声明不一致（节点缓存可能未更新），尝试其它节点')
+                continue
+            if node != self.cdn_node:
+                logger.info(f'{what} 由 {node} 获取（原节点内容不一致）')
+                self.cdn_node = node
+            return raw, node
+        return None, None
+
     def get_pack_resources(self, name):
         if name in self.pack_resources_cache:
             return self.pack_resources_cache[name]
@@ -229,15 +259,9 @@ class Launcher:
         if not pack:
             logger.error(f'资源索引中不存在资源包: {name}')
             return None
-        url = urljoin(self.cdn_node, pack['indexFile'])
-        raw = self.get_result_bytes(url)
+        raw, _ = self.fetch_verified(pack['indexFile'], pack.get('indexFileMd5'), f'资源包清单 {name}')
         if raw is None:
             logger.error(f'资源包清单下载失败: {name}')
-            return None
-        expect_md5 = pack.get('indexFileMd5')
-        actual_md5 = hashlib.md5(raw).hexdigest()
-        if expect_md5 and actual_md5 != expect_md5:
-            logger.error(f'资源包清单校验失败: {name} (期望 {expect_md5}, 实际 {actual_md5})')
             return None
         try:
             data = json.loads(raw.decode('utf-8'))
@@ -266,7 +290,11 @@ class Launcher:
         if resources is None:
             return False
         for resource in resources:
-            if not self.game_folder_path.joinpath(Path(resource['dest'])).exists():
+            file_path = self.game_folder_path.joinpath(Path(resource['dest']))
+            try:
+                if file_path.stat().st_size != int(resource['size']):
+                    return False
+            except OSError:
                 return False
         return True
 
@@ -288,10 +316,14 @@ class Launcher:
     def download_game(self):
         logger.info('Start downloading game client files...')
         self.state = LauncherState.DOWNLOADING
+        self.downloaded_bytes = 0
+        self.download_game_progress.finished_size = 0
+        self.download_game_progress.finished_count = 0
         resource_list = self.get_resource_list()
         if resource_list is None:
             raise RuntimeError('无法获取官方资源清单，请稍后重试')
         self.download_game_progress.total_count = len(resource_list)
+        self.download_game_progress.total_size = 0
         for resource in resource_list:
             self.download_game_progress.total_size += resource['size']
         length = self.download_game_progress.total_count
@@ -305,30 +337,68 @@ class Launcher:
             self.download_file_with_resume(url=download_url, file_path=file_path, flag='download', file_size=file_size)
             self.download_game_progress.finished_count += 1
     
-    def update_game(self):
+    def get_progress(self, flag):
+        table = {
+            'download': self.download_game_progress,
+            'update': self.update_game_progress,
+            'update_patch': self.update_game_progress_patch,
+            'verify': self.verify_game_progress,
+        }
+        progress = table.get(flag)
+        if progress is None:
+            raise RuntimeError(f'未知的进度类型: {flag}')
+        return progress
+
+    def estimate_pending_download(self, resource_list):
+        """估算待下载体积与文件数"""
+        pending_bytes = 0
+        pending_count = 0
+        for resource in resource_list:
+            file_path = self.game_folder_path.joinpath(Path(resource['dest']))
+            try:
+                local_size = file_path.stat().st_size
+            except OSError:
+                local_size = None
+            size = int(resource['size'])
+            if local_size is None or local_size != size:
+                pending_bytes += size
+                pending_count += 1
+        return pending_bytes, pending_count
+
+    def update_game(self, skip_dests=None, flag='update', totals=None):
+        """增量更新"""
         logger.info('Starting update game client files...')
         self.state = LauncherState.UPDATING
         resource_list = self.get_resource_list()
         if resource_list is None:
             raise RuntimeError('无法获取官方资源清单，请稍后重试')
-        self.update_game_progress.total_count = len(resource_list)
-        for resource in resource_list:
-            self.update_game_progress.total_size += resource['size']
-        length = self.update_game_progress.total_count
-        for file in resource_list:
+        skip = set(skip_dests or ())
+        targets = [resource for resource in resource_list if resource['dest'] not in skip]
+        progress = self.get_progress(flag)
+        if totals is None:
+            progress.total_size, progress.total_count = self.estimate_pending_download(targets)
+            progress.finished_size = 0
+            progress.finished_count = 0
+        else:
+            progress.total_size, progress.total_count = int(totals[0]), int(totals[1])
+        logger.info(
+            '待下载估算: %.2f GB / %d 个文件（%d 个文件已由补丁覆盖并跳过）'
+            % (progress.total_size / 1024 ** 3, progress.total_count, len(resource_list) - len(targets))
+        )
+        length = len(targets)
+        for index, file in enumerate(targets):
             file_path = self.game_folder_path.joinpath(Path(file['dest']))
             file_size = int(file['size'])
-            updated_count = self.update_game_progress.finished_count
-            logger.info(f"Updataing file {updated_count + 1} / {length}: {file_path}")
+            logger.info(f"Updataing file {index + 1} / {length}: {file_path}")
             # 无文件时下载整个文件
             if not file_path.exists():
                 logger.warning(f'{file_path} not found, downloading whole file')
                 self.download_file_with_resume(
                     url=self.build_download_url(file['dest']),
                     file_path=file_path,
-                    flag='update'
+                    flag=flag
                 )
-                self.update_game_progress.finished_count += 1
+                progress.finished_count += 1
                 continue
             # 有 chunkInfos 文件做分块增量
             if file.get('chunkInfos'):
@@ -336,22 +406,17 @@ class Launcher:
                     self.build_download_url(file['dest']),
                     file_path,
                     file,
-                    flag='update'
+                    flag=flag
                 )
                 if downloaded >= 0:
-                    self.update_progress(
-                        flag='update',
-                        value=file_size
-                    )
-                    self.update_game_progress.finished_count += 1
+                    progress.finished_count += 1
                     logger.info(f'{file_path} chunk-level update done, downloaded {downloaded / 1024 / 1024:.1f} MB')
                     continue
                 logger.warning(f'{file_path} chunk-level update failed, fallback to whole file download')
             # 回退整文件md5
             current_md5 = self.get_file_md5(file_path)
             if current_md5 == file['md5']:
-                self.update_progress(flag='update',value=file_size)
-                self.update_game_progress.finished_count += 1
+                progress.finished_count += 1
                 logger.info(f'{file_path} MD5 match')
                 continue
             logger.warning(f'{file_path} MD5 mismatch (expected: {file["md5"]}, got: {current_md5})')
@@ -359,9 +424,9 @@ class Launcher:
                 url=self.build_download_url(file['dest']),
                 file_path=file_path,
                 overwrite=True,
-                flag='update'
+                flag=flag
             )
-            self.update_game_progress.finished_count += 1
+            progress.finished_count += 1
     
     def download_patch(self):
         if not self.patch_targets:
@@ -379,14 +444,16 @@ class Launcher:
         self.temp_folder_path = self.game_folder_path.parent / 'temp_folder'
         if not self.temp_folder_path.exists():
             self.temp_folder_path.mkdir()
-        total_count = 0
-        total_size = 0
+        progress = self.update_game_progress_patch
+        patch_count = 0
+        patch_size = 0
         for target in self.patch_targets:
             for file in target['manifest'].get('resource', []):
-                total_count += 1
-                total_size += int(file['size'])
-        self.update_game_progress_patch.total_count = total_count
-        self.update_game_progress_patch.total_size = total_size
+                patch_count += 1
+                patch_size += int(file['size'])
+        if not progress.total_size:
+            progress.total_size = patch_size
+            progress.total_count = patch_count
         done = 0
         for target in self.patch_targets:
             pack = target['pack']
@@ -410,7 +477,7 @@ class Launcher:
                     file_path = pack_temp.joinpath(Path(file['dest']))
                 download_url = quote(download_url, safe=':/')
                 done += 1
-                logger.info(f'Downloading patch resource {done}/{total_count} [{pack}]: {file_path}')
+                logger.info(f'Downloading patch resource {done}/{patch_count} [{pack}]: {file_path}')
                 if not self.download_file_with_resume(
                     url=download_url,
                     file_path=file_path,
@@ -418,9 +485,29 @@ class Launcher:
                     file_size=file_size
                 ):
                     raise RuntimeError(f'补丁资源下载失败: {file_path}')
-                self.update_game_progress_patch.finished_count += 1
+                if 'fromFolder' in file:
+                    self.verify_patch_file(file_path, file, download_url)
+                    self.patch_covered_dests.add(file['dest'])
+                progress.finished_count += 1
 
-    def merge_patch(self):
+    def verify_patch_file(self, file_path, file_info, download_url):
+        """校验文件"""
+        expect_md5 = file_info.get('md5')
+        if not expect_md5:
+            return
+        if self.get_file_md5(file_path) == expect_md5:
+            return
+        logger.warning(f'{file_path} 补丁资源 MD5 不符，重新下载')
+        self.download_file_with_resume(
+            url=download_url,
+            file_path=file_path,
+            overwrite=True,
+            flag='update_patch'
+        )
+        if self.get_file_md5(file_path) != expect_md5:
+            raise RuntimeError(f'补丁资源校验失败: {file_path}')
+
+    def merge_patch(self) -> set:
         if not self.patch_targets:
             raise RuntimeError('增量补丁清单不可用')
         if not self.temp_folder_path:
@@ -436,7 +523,8 @@ class Launcher:
                 if not patch_path.exists():
                     raise RuntimeError(f'缺少组补丁文件: {patch_path}')
                 logger.info(f'Applying patch group {i+1}/{length} [{pack}]: {group_dest}')
-                self.apply_group_patch(patch_path, group)
+                produced = self.apply_group_patch(patch_path, group)
+                self.patch_covered_dests |= produced or set()
             for rel in target['manifest'].get('deleteFiles', []):
                 delete_path = self.game_folder_path.joinpath(Path(rel))
                 if delete_path.exists():
@@ -446,79 +534,148 @@ class Launcher:
         if self.temp_folder_path and self.temp_folder_path.exists():
             shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
         self.temp_folder_path = None
+        return self.patch_covered_dests
 
-    def apply_group_patch(self, patch_path, group):
+    def apply_group_patch(self, patch_path, group) -> set:
         try:
             from . import krpdiff
         except ImportError:
             import krpdiff
-        patch = krpdiff.parse_dir_patch(patch_path.read_bytes())
-        total_stream = patch.old_stream_size + patch.new_stream_size
-        if total_stream > PATCH_STREAM_MEMORY_LIMIT:
-            total_gib = total_stream / 1024 ** 3
-            raise RuntimeError(f'组补丁数据量过大({total_gib:.2f} GiB)，回退全量更新')
-        src_md5 = {f['dest']: f['md5'] for f in group.get('srcFiles', [])}
+        src_info = {f['dest']: (f['md5'], int(f['size'])) for f in group.get('srcFiles', [])}
         dst_info = {f['dest']: (f['md5'], int(f['size'])) for f in group.get('dstFiles', [])}
         dst_chunk_infos = {f['dest']: f.get('chunkInfos') for f in group.get('dstFiles', [])}
-        def read_old(rel_path):
-            file_path = self.game_folder_path.joinpath(Path(rel_path))
-            data = file_path.read_bytes()
-            expect_md5 = src_md5.get(rel_path)
-            if expect_md5 and hashlib.md5(data).hexdigest() != expect_md5:
-                raise krpdiff.KrpdiffError(f'旧文件 MD5 不符: {rel_path}')
-            return data
-        for new_path, content in patch.apply(read_old):
-            expect = dst_info.get(new_path)
+        game_dir = self.game_folder_path
+
+        def verify_old(path, expected_size):
+            """应用前校验旧文件"""
+            rel_path = os.path.relpath(path, str(game_dir)).replace(os.sep, '/')
+            try:
+                digest, size = krpdiff.md5_file(path)
+            except OSError as e:
+                raise krpdiff.KrpdiffError(f'旧文件不可读: {rel_path} ({e})') from e
+            expect = src_info.get(rel_path)
             if expect:
-                if len(content) != expect[1] or hashlib.md5(content).hexdigest() != expect[0]:
-                    raise krpdiff.KrpdiffError(f'补丁输出 MD5 不符: {new_path}')
-            else:
-                logger.warning(f'补丁输出未在清单中登记: {new_path}')
-            file_path = self.game_folder_path.joinpath(Path(new_path))
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_bytes(content)
-            chunk_infos = dst_chunk_infos.get(new_path)
+                if digest != expect[0] or size != expect[1]:
+                    raise krpdiff.KrpdiffError(
+                        f'旧文件 MD5 不符: {rel_path} (实际 {digest}/{size}, 期望 {expect[0]}/{expect[1]})')
+            elif expected_size is not None and size != expected_size:
+                raise krpdiff.KrpdiffError(
+                    f'旧文件大小不符: {rel_path} (实际 {size}, 期望 {expected_size})')
+            return size
+
+        def open_writer(rel_path, size):
+            expect = dst_info.get(rel_path)
+            if expect is None:
+                logger.warning(f'补丁输出未在清单中登记: {rel_path}')
+            target = game_dir.joinpath(Path(rel_path))
+            return krpdiff.PatchWriter(
+                target,
+                expect[1] if expect else size,
+                expect[0] if expect else None,
+            )
+
+        with open(patch_path, 'rb') as patch_file:
+            patch = krpdiff.parse_dir_patch(patch_file)
+            old_stream = krpdiff.OldStream.from_refs(patch.old_ref_files, game_dir, verify=verify_old)
+            try:
+                produced = patch.apply_streaming(old_stream, open_writer)
+            finally:
+                old_stream.close()
+
+        covered = set(produced)
+        for rel_path in produced:
+            chunk_infos = dst_chunk_infos.get(rel_path)
             if chunk_infos:
-                self.cache_chunks_md5(file_path, chunk_infos)
+                self.cache_chunks_md5(game_dir.joinpath(Path(rel_path)), chunk_infos)
         for copy in patch.copy_files:
-            src_path = self.game_folder_path.joinpath(Path(copy.old_path))
-            dst_path = self.game_folder_path.joinpath(Path(copy.new_path))
+            src_path = game_dir.joinpath(Path(copy.old_path))
+            dst_path = game_dir.joinpath(Path(copy.new_path))
             if src_path == dst_path:
                 continue
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(str(src_path), str(dst_path))
         # 空文件与目录
         for rel in patch.empty_files:
-            file_path = self.game_folder_path.joinpath(Path(rel))
+            file_path = game_dir.joinpath(Path(rel))
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_bytes(b'')
         for rel in patch.new_dirs:
             if rel:
-                self.game_folder_path.joinpath(Path(rel)).mkdir(parents=True, exist_ok=True)
+                game_dir.joinpath(Path(rel)).mkdir(parents=True, exist_ok=True)
         # 可执行位
         if patch.execute_files and os.name == 'posix':
             for rel in patch.execute_files:
-                file_path = self.game_folder_path.joinpath(Path(rel))
+                file_path = game_dir.joinpath(Path(rel))
                 if file_path.exists():
                     file_path.chmod(file_path.stat().st_mode | 0o111)
+        return covered
+
+    def patch_plan(self) -> dict:
+        """计算本次增量更新预估下载量"""
+        patch_bytes = 0
+        patch_count = 0
+        covered = set()
+        for target in self.patch_targets:
+            manifest = target['manifest']
+            for file in manifest.get('resource', []):
+                patch_bytes += int(file['size'])
+                patch_count += 1
+                if 'fromFolder' in file:
+                    covered.add(file['dest'])
+            for group in manifest.get('groupInfos', []):
+                for file in group.get('dstFiles', []):
+                    covered.add(file['dest'])
+        resource_list = self.get_resource_list() or []
+        remaining = [resource for resource in resource_list if resource['dest'] not in covered]
+        extra_bytes, extra_count = self.estimate_pending_download(remaining)
+        return {
+            'patch_bytes': patch_bytes,
+            'patch_count': patch_count,
+            'covered': covered,
+            'extra_bytes': extra_bytes,
+            'extra_count': extra_count,
+        }
+
     def update_game_with_patch(self):
         self.state = LauncherState.UPDATING
         used_patch = False
-        try:
-            if self.patch_targets:
+        self.patch_covered_dests = set()
+        self.downloaded_bytes = 0
+        progress = self.update_game_progress_patch
+        if self.patch_targets:
+            plan = self.patch_plan()
+            total_bytes = plan['patch_bytes'] + plan['extra_bytes']
+            total_count = plan['patch_count'] + plan['extra_count']
+            progress.total_size = total_bytes
+            progress.total_count = total_count
+            progress.finished_size = 0
+            progress.finished_count = 0
+            logger.info(
+                '本次更新预估下载 %.2f GB（官方增量补丁 %.2f GB + 其余资源 %.2f GB）'
+                % (total_bytes / 1024 ** 3, plan['patch_bytes'] / 1024 ** 3, plan['extra_bytes'] / 1024 ** 3)
+            )
+            try:
                 self.download_patch()
                 self.merge_patch()
                 used_patch = True
-                logger.info('组补丁增量更新完成')
-        except Exception as e:
-            logger.exception(f'组补丁增量更新失败，回退到常规更新流程: {e}')
-            try:
-                if self.temp_folder_path and self.temp_folder_path.exists():
-                    shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
-                self.temp_folder_path = None
-            except Exception:
-                pass
-        self.update_game() # again
+                logger.info(f'组补丁增量更新完成，已覆盖 {len(self.patch_covered_dests)} 个文件')
+            except Exception as e:
+                logger.exception(f'组补丁增量更新失败，回退到常规更新流程: {e}')
+                self.patch_covered_dests = set()
+                try:
+                    if self.temp_folder_path and self.temp_folder_path.exists():
+                        shutil.rmtree(str(self.temp_folder_path), ignore_errors=True)
+                    self.temp_folder_path = None
+                except Exception:
+                    pass
+        if used_patch:
+            self.update_game(
+                skip_dests=self.patch_covered_dests,
+                flag='update_patch',
+                totals=(progress.total_size, progress.total_count),
+            )
+        else:
+            self.update_game() # again
         return used_patch
 
     def verify_gamefile(self):
@@ -526,6 +683,11 @@ class Launcher:
         resource_list = self.get_resource_list()
         if resource_list is None:
             raise RuntimeError('无法获取官方资源清单，请稍后重试')
+        self.verify_failures = []
+        self.downloaded_bytes = 0
+        self.verify_game_progress.total_size = 0
+        self.verify_game_progress.finished_size = 0
+        self.verify_game_progress.finished_count = 0
         
         chunk_paks = []
         
@@ -550,10 +712,13 @@ class Launcher:
             download_url = self.build_download_url(file['dest'])
             if not file_path.exists():
                 logger.warning(f'{file_path} not found, downloading whole file')
-                self.download_file_with_resume(
+                ok = self.download_file_with_resume(
                     url=download_url,
                     file_path=file_path
                 )
+                if not ok or self.get_file_md5(file_path) != file['md5']:
+                    self.verify_failures.append(file['dest'])
+                    logger.error(f'{file_path} 校验失败')
                 self.update_progress(
                     flag='verify',
                     value=file_size
@@ -589,9 +754,16 @@ class Launcher:
                 logger.info(f'{file_path} MD5 OK after re-download')
             else:
                 logger.error(f'{file_path} Still MD5 mismatch after re-download')
+                self.verify_failures.append(file['dest'])
             self.update_progress(flag='verify',value=int(file['size']))
-            
-        self.update_localVersion()
+
+        if self.verify_failures:
+            logger.error(f'有 {len(self.verify_failures)} 个文件校验失败，本次不写入版本号，避免把不完整安装标记为最新')
+        else:
+            self.update_localVersion()
+
+    def has_verify_failures(self):
+        return bool(getattr(self, 'verify_failures', None))
     
     def get_result_bytes(self, url):
         try:
@@ -751,9 +923,16 @@ class Launcher:
             os.makedirs(directory)
         
         if os.path.exists(file_path):
-            if not overwrite:
-                if file_size:
-                    self.update_progress(flag=flag, value=file_size)
+            local_size = os.path.getsize(file_path)
+            if not overwrite and file_size and local_size != int(file_size):
+                logger.warning(f'{file_path} size mismatch ({local_size} != {file_size}), re-downloading')
+                os.remove(file_path)
+                temp_leftover = directory / f'{file_path.name}.temp'
+                if temp_leftover.exists():
+                    os.remove(temp_leftover)
+            elif not overwrite:
+                if file_size and flag == 'download':
+                    self.update_progress(flag=flag, value=int(file_size))
                 logger.info(f'{file_path} already exists. Skipping download.')
                 return True
             else:
@@ -867,7 +1046,7 @@ class Launcher:
                     got += len(data)
                     self.downloaded_bytes += len(data)
                     remaining -= len(data)
-                    self.update_progress(flag=flag, value=0)
+                    self.update_progress(flag=flag, value=len(data))
                 if remaining > 0:
                     return -1
                 f.flush()
@@ -955,6 +1134,33 @@ class Launcher:
             logger.error(f'Chunk update error for {file_path}: {str(e)}')
             return -1
     
+    def check_patch_applicable(self, name, manifest):
+        missing = []
+        bad_size = []
+        checked = 0
+        for group in manifest.get('groupInfos', []):
+            for file in group.get('srcFiles', []):
+                checked += 1
+                file_path = self.game_folder_path.joinpath(Path(file['dest']))
+                try:
+                    local_size = file_path.stat().st_size
+                except OSError:
+                    missing.append(file['dest'])
+                    continue
+                expect_size = file.get('size')
+                if expect_size is not None and local_size != int(expect_size):
+                    bad_size.append(file['dest'])
+        if missing or bad_size:
+            logger.warning(
+                f'资源包 {name} 的官方增量补丁不适用于本地文件（校验 {checked} 个旧文件：缺失 {len(missing)} 个，'
+                f'大小不符 {len(bad_size)} 个），将使用常规更新'
+            )
+            for rel in (missing + bad_size)[:5]:
+                logger.warning(f'不适用: {rel}')
+            return False
+        logger.info(f'资源包 {name} 增量补丁预检通过（{checked} 个旧文件齐备）')
+        return True
+
     def init_incremental_update(self):
         self.support_incremental_patching = False
         self.patch_targets = []
@@ -973,18 +1179,20 @@ class Launcher:
             if entry is None:
                 logger.info(f'资源包 {name} 无适用于 {self.local_version} 的官方增量补丁，将由常规更新补齐')
                 continue
-            raw = self.get_result_bytes(urljoin(self.cdn_node, entry['indexFile']))
+            raw, _ = self.fetch_verified(
+                entry['indexFile'],
+                entry.get('indexFileMd5'),
+                f'资源包 {name} 增量补丁清单'
+            )
             if raw is None:
                 logger.warning(f'资源包 {name} 增量补丁清单下载失败，将由常规更新补齐')
-                continue
-            expect_md5 = entry.get('indexFileMd5')
-            if expect_md5 and hashlib.md5(raw).hexdigest() != expect_md5:
-                logger.warning(f'资源包 {name} 增量补丁清单校验失败，将由常规更新补齐')
                 continue
             try:
                 manifest = json.loads(raw.decode('utf-8'))
             except (ValueError, UnicodeError):
                 logger.warning(f'资源包 {name} 增量补丁清单解析失败，将由常规更新补齐')
+                continue
+            if not self.check_patch_applicable(name, manifest):
                 continue
             targets.append({'pack': name, 'entry': entry, 'manifest': manifest})
         if not targets:
@@ -1006,7 +1214,12 @@ class Launcher:
             self.verify_game_progress.finished_size += value
         elif flag == "update_patch":
             self.update_game_progress_patch.finished_size += value
-        
+
+        if flag in ("update", "update_patch"):
+            progress = self.update_game_progress if flag == "update" else self.update_game_progress_patch
+            if progress.finished_size > progress.total_size:
+                progress.total_size = progress.finished_size
+
         mutil_progress = {
             "download": self.download_game_progress,
             "verify": self.verify_game_progress,
