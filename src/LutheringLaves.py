@@ -78,6 +78,7 @@ class LauncherState(Enum):
     UPDATING = 6
     MERGEING = 7
     NETWORKERROR = 8
+    NEEDREPAIR = 9
 
 class ProgressInfo:
     def __init__(self):
@@ -127,6 +128,7 @@ class Launcher:
         # 资源包信息
         self.resource_packs = self.launcher_info.get('resourcePacks') or {}
         self.pack_resources_cache = {}
+        self.pack_raw_cache = {}
         self.dest_base_map = {}
         self.current_version = (self.resource_packs.get('common') or {}).get('version')
         if not self.current_version:
@@ -183,6 +185,11 @@ class Launcher:
                     self.state = LauncherState.NEEDUPDATE
                     logger.info(f'resource pack {pack} not complete, set launcher state to NEEDUPDATE')
                     return
+            problems = self.gamedir_layout_diff()
+            if problems:
+                self.state = LauncherState.NEEDREPAIR
+                logger.info(f'game dir layout mismatch, set launcher state to NEEDREPAIR: {problems}')
+                return
     
     def init_launcher_settings(self):
         settings_file_path = Path(base_dir) / 'settings.json'
@@ -295,6 +302,7 @@ class Launcher:
             return None
         resources = data.get('resource') or []
         self.pack_resources_cache[name] = resources
+        self.pack_raw_cache[name] = raw
         return resources
 
     def get_resource_list(self):
@@ -964,17 +972,189 @@ class Launcher:
             return data.get('version', None)
     
     def get_localPackVersions(self):
+        data = {}
         file_path = self.game_folder_path / "launcherDownloadConfig.json"
-        if not os.path.exists(file_path):
-            return None
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    data = json.load(file)
+            except (ValueError, OSError):
+                data = {}
+        packs = {}
+        local_packs = data.get('packs')
+        if isinstance(local_packs, dict):
+            for name, version in local_packs.items():
+                if version:
+                    packs[name] = version
+        bundles = data.get('bundles')
+        if isinstance(bundles, dict):
+            for bundle_name, record in bundles.items():
+                if not isinstance(record, dict) or not record.get('version'):
+                    continue
+                names = record.get('resourcePacks') or self.bundle_resource_packs(bundle_name)
+                for name in names:
+                    packs.setdefault(name, record['version'])
+        for name in ('common',) + QUALITY_LEVELS:
+            version = self.read_pack_version_record(name)
+            if version:
+                packs[name] = version
+        return packs or None
+
+    def pack_records_dir(self):
+        return self.game_folder_path / 'launcherDownloadConfig'
+
+    def pack_cache_dir(self, name):
+        version = (self.resource_packs.get(name) or {}).get('version') or ''
+        return self.game_folder_path / 'launcherDownload' / name / version
+
+    def bundle_resource_packs(self, bundle_name):
+        definitions = (getattr(self, 'launcher_info', None) or {}).get('bundles') or {}
+        for defined_name, definition in definitions.items():
+            if defined_name.lower() == bundle_name.lower() and definition.get('resourcePacks'):
+                return list(definition['resourcePacks'])
+        return ['common', bundle_name.lower()]
+
+    def read_pack_version_record(self, name):
+        path = self.pack_records_dir() / f'{name}.json'
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
+            with open(path, 'r', encoding='utf-8') as file:
                 data = json.load(file)
         except (ValueError, OSError):
             return None
-        packs = data.get('packs')
-        return packs if isinstance(packs, dict) else None
+        version = data.get('version') if isinstance(data, dict) else None
+        return version or None
+
+    def write_pack_version_record(self, name, version):
+        path = self.pack_records_dir() / f'{name}.json'
+        content = {"packName": name, "version": version}
+        try:
+            if path.exists():
+                try:
+                    with open(path, 'r', encoding='utf-8') as file:
+                        if json.load(file) == content:
+                            return
+                except (ValueError, OSError):
+                    pass
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as file:
+                json.dump(content, file, ensure_ascii=False, separators=(',', ':'))
+        except OSError as e:
+            logger.warning(f'写入资源包版本记录失败 {name}: {e}')
+
+    def clear_pack_records(self, names):
+        for name in names:
+            path = self.pack_records_dir() / f'{name}.json'
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError as e:
+                logger.warning(f'删除资源包版本记录失败 {name}: {e}')
+            cache_dir = self.pack_cache_dir(name)
+            if cache_dir.is_dir():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def write_pack_manifest_cache(self, name):
+        raw = getattr(self, 'pack_raw_cache', {}).get(name)
+        if not raw:
+            return
+        path = self.pack_cache_dir(name) / 'OriginResource.json'
+        try:
+            if path.exists():
+                with open(path, 'rb') as file:
+                    if file.read() == raw:
+                        return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'wb') as file:
+                file.write(raw)
+        except OSError as e:
+            logger.warning(f'写入资源包清单缓存失败 {name}: {e}')
+
+    def build_local_bundles(self, packs, verified_names):
+        bundles = {}
+        for name in QUALITY_LEVELS:
+            members = self.bundle_resource_packs(name.upper())
+            if not set(members) <= set(verified_names):
+                continue
+            version = (self.resource_packs.get(name) or {}).get('version')
+            if not version:
+                continue
+            bundles[name.upper()] = {
+                "version": version,
+                "state": "",
+                "resourcePacks": members,
+            }
+        return bundles
     
+    def key_file_check_list(self):
+        config = (getattr(self, 'launcher_info', None) or {}).get('config') or {}
+        if str(config.get('keyFileCheckSwitch', 0)) != '1':
+            return []
+        return list(config.get('keyFileCheckList') or [])
+
+    def gamedir_layout_diff(self):
+        problems = []
+        config_path = self.game_folder_path / 'launcherDownloadConfig.json'
+        data = {}
+        if not config_path.exists():
+            problems.append('缺少 launcherDownloadConfig.json')
+        else:
+            try:
+                with open(config_path, 'r', encoding='utf-8') as file:
+                    data = json.load(file) or {}
+            except (ValueError, OSError):
+                problems.append('launcherDownloadConfig.json 内容无法解析')
+                data = {}
+
+        quality = self.get_download_quality()
+        bundle_name = quality.upper()
+        members = self.bundle_resource_packs(bundle_name)
+        bundle_version = (self.resource_packs.get(quality) or {}).get('version')
+
+        if data:
+            if not data.get('appId'):
+                problems.append('launcherDownloadConfig.json 缺少 appId')
+            bundle = (data.get('bundles') or {}).get(bundle_name)
+            if not isinstance(bundle, dict):
+                problems.append(f'bundles 里没有 {bundle_name} 档位记录')
+            else:
+                if bundle_version and bundle.get('version') != bundle_version:
+                    problems.append(f'bundles.{bundle_name}.version 与索引不一致')
+                if sorted(bundle.get('resourcePacks') or []) != sorted(members):
+                    problems.append(f'bundles.{bundle_name}.resourcePacks 与索引定义不一致')
+
+        for name in members:
+            version = (self.resource_packs.get(name) or {}).get('version')
+            if not version:
+                continue
+            if self.read_pack_version_record(name) != version:
+                problems.append(f'缺少资源包版本文件 launcherDownloadConfig/{name}.json')
+            try:
+                cached = (self.pack_cache_dir(name) / 'OriginResource.json').read_bytes()
+            except OSError:
+                cached = None
+            raw = (self.pack_raw_cache or {}).get(name)
+            if not cached:
+                problems.append(f'缺少资源包清单缓存 launcherDownload/{name}/{version}/OriginResource.json')
+            elif raw is not None and cached != raw:
+                problems.append(f'资源包清单缓存 {name} 与索引中的清单不一致')
+
+        for rel in self.key_file_check_list():
+            try:
+                if self.game_folder_path.joinpath(Path(rel)).stat().st_size == 0:
+                    problems.append(f'关键文件为空 {rel}')
+            except OSError:
+                problems.append(f'缺少关键文件 {rel}')
+        return problems
+
+    def repair_layout(self):
+        logger.info('repairing install layout...')
+        for name in ('common', self.get_download_quality()):
+            self.get_pack_resources(name)
+        self.update_localVersion()
+        problems = self.gamedir_layout_diff()
+        logger.info(f'repair finished, remaining problems: {problems}')
+        return problems
+
     def update_localVersion(self):
         packs = dict(self.local_pack_versions) if self.local_pack_versions else {}
         if self.local_pack_versions is None and self.local_version:
@@ -985,17 +1165,27 @@ class Launcher:
             if target_version and self.is_pack_files_present(name):
                 packs[name] = target_version
         self.local_pack_versions = packs
+        verified_names = set()
+        for name in ('common', self.get_download_quality()):
+            version = packs.get(name)
+            if version and self.is_pack_files_present(name):
+                verified_names.add(name)
+                self.write_pack_version_record(name, version)
+                self.write_pack_manifest_cache(name)
         temp = {
             "version":self.current_version,
             "reUseVersion":"",
             "state":"",
             "isPreDownload":False,
             "appId":"10003",
-            "packs":packs
+            "packs":packs,
+            "bundles":self.build_local_bundles(packs, verified_names)
         }
         file_path = self.game_folder_path / "launcherDownloadConfig.json"
         with open(file_path, 'w', encoding='utf-8') as file:
             json.dump(temp, file, ensure_ascii=False)
+        if self.current_version:
+            self.local_version = self.current_version
     
     def get_quality_status(self):
         resource_packs = getattr(self, 'resource_packs', None)
@@ -1047,6 +1237,7 @@ class Launcher:
                         logger.error(f'删除失败 {file_path}: {e}')
             if self.local_pack_versions is not None:
                 self.local_pack_versions.pop(name, None)
+            self.clear_pack_records([name])
         self.update_localVersion()
         return deleted_count, freed_bytes
     

@@ -59,6 +59,25 @@ class DownloadWorker(QThread):
             logger.info(f"Worker started with state: {self.launcher.state}")
             self.launcher.downloaded_bytes = 0
 
+            if self.launcher.state == LauncherState.NEEDREPAIR:
+                logger.info("Starting install layout repair...")
+                problems = self.launcher.repair_layout()
+                if problems:
+                    logger.error(f"Repair unfinished: {problems}")
+                    self.error.emit('修复未完成：' + '；'.join(problems[:2]))
+                    return
+                logger.info("Verifying game files after repair...")
+                self.launcher.verify_gamefile()
+                if self.launcher.has_verify_failures():
+                    failed = len(self.launcher.verify_failures)
+                    logger.error(f"Verify failed for {failed} files, keep state NEEDREPAIR")
+                    self.launcher.state = LauncherState.NEEDREPAIR
+                    self.error.emit(f'有 {failed} 个文件校验失败，请重新修复')
+                    return
+                self.launcher.state = LauncherState.STARTGAME
+                logger.info("Repair finished.")
+                self.download_finished.emit()
+
             if self.launcher.state == LauncherState.NEEDINSTALL:
                 logger.info("Starting game download...")
                 self.launcher.download_game()
@@ -209,6 +228,9 @@ class MainWindow(QMainWindow):
             else:
                 self.action_button.setText('更新游戏')
             self.action_button.setEnabled(True)
+        if self.launcher.state == LauncherState.NEEDREPAIR:
+            self.action_button.setText('修复游戏')
+            self.action_button.setEnabled(True)
 
             
     def set_window_icon(self):
@@ -296,7 +318,7 @@ class MainWindow(QMainWindow):
         logger.info("Settings button clicked")
         settings_window = SettingsWindow(self, launcher=self.launcher)
         settings_window.exec()
-        if self.launcher.state in (LauncherState.STARTGAME, LauncherState.NEEDINSTALL, LauncherState.NEEDUPDATE):
+        if self.launcher.state in (LauncherState.STARTGAME, LauncherState.NEEDINSTALL, LauncherState.NEEDUPDATE, LauncherState.NEEDREPAIR):
             self.launcher.init_launcher_state()
             self.init_launcher_state()
 
@@ -325,6 +347,15 @@ class MainWindow(QMainWindow):
             logger.info("Starting download worker for update.")
             self.worker = DownloadWorker(self.launcher)
             self.worker.update_progress.connect(self.update_progress_ui)
+            self.worker.verify_progress.connect(self.verify_progress_ui)
+            self.worker.download_finished.connect(self.download_finished_ui)
+            self.worker.error.connect(self.download_error)
+            self.worker.start()
+            return
+
+        if self.launcher.state == LauncherState.NEEDREPAIR:
+            logger.info("Starting download worker for repair.")
+            self.worker = DownloadWorker(self.launcher)
             self.worker.verify_progress.connect(self.verify_progress_ui)
             self.worker.download_finished.connect(self.download_finished_ui)
             self.worker.error.connect(self.download_error)
